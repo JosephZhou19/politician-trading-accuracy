@@ -4,11 +4,14 @@
 PRAGMA foreign_keys = ON;
 
 -- Identity is inferred purely from (first_name, last_name, chamber) since neither
--- Senate eFD nor House Clerk exposes a stable per-person ID.
+-- Senate eFD nor House Clerk exposes a stable per-person ID. COLLATE NOCASE on the name
+-- columns makes both the UNIQUE constraint and lookups case-insensitive, since older
+-- Senate filings render names in ALL CAPS while newer ones don't - without this, the
+-- same senator ends up as two separate rows depending on which era's filing hit first.
 CREATE TABLE IF NOT EXISTS legislators (
     id            INTEGER PRIMARY KEY,
-    first_name    TEXT NOT NULL,
-    last_name     TEXT NOT NULL,
+    first_name    TEXT NOT NULL COLLATE NOCASE,
+    last_name     TEXT NOT NULL COLLATE NOCASE,
     chamber       TEXT NOT NULL CHECK (chamber IN ('house', 'senate')),
     filer_status  TEXT NOT NULL CHECK (filer_status IN ('member', 'former_member', 'candidate')),
     UNIQUE (first_name, last_name, chamber)
@@ -26,7 +29,7 @@ CREATE TABLE IF NOT EXISTS filings (
     is_amendment        INTEGER NOT NULL DEFAULT 0 CHECK (is_amendment IN (0, 1)),
     filing_date         TEXT NOT NULL,
     source_url          TEXT NOT NULL,
-    document_format     TEXT NOT NULL CHECK (document_format IN ('html', 'pdf')),
+    document_format     TEXT NOT NULL CHECK (document_format IN ('html', 'pdf', 'image')),
     raw_file_path       TEXT,
     raw_doc_hash        TEXT,
     fetched_at          TEXT NOT NULL,
