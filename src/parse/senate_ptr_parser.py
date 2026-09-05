@@ -56,7 +56,7 @@ def parse_report_html(html):
         cells = tr.find_all("td")
         if len(cells) != 9:
             continue
-        _, date_cell, owner_cell, ticker_cell, asset_cell, type_cell, txn_cell, amount_cell, comment_cell = cells
+        id_cell, date_cell, owner_cell, ticker_cell, asset_cell, type_cell, txn_cell, amount_cell, comment_cell = cells
 
         ticker_link = ticker_cell.find("a")
         ticker = ticker_link.get_text(strip=True) if ticker_link else None
@@ -67,6 +67,7 @@ def parse_report_html(html):
         owner_raw = owner_cell.get_text(strip=True)
 
         trades.append({
+            "source_row_number": int(id_cell.get_text(strip=True)),
             "ticker": ticker,
             "asset_name": asset_cell.get_text(strip=True),
             "asset_type": type_cell.get_text(strip=True) or None,

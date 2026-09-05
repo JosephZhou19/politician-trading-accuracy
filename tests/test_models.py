@@ -110,6 +110,7 @@ def test_insert_trade_from_real_armstrong_filing(conn):
     trade_id = models.insert_trade(
         conn,
         filing_id=filing_id,
+        source_row_number=703,
         ticker="UHS",
         asset_name="Universal Health Services, Inc. Common Stock",
         asset_type="Stock",
@@ -126,6 +127,7 @@ def test_insert_trade_from_real_armstrong_filing(conn):
     adr_trade_id = models.insert_trade(
         conn,
         filing_id=filing_id,
+        source_row_number=700,
         ticker=None,
         asset_name="Recruit Holdings Co Ltd Unsponsored ADR (RCRUY)",
         asset_type="Stock",
@@ -160,6 +162,7 @@ def test_insert_trade_is_idempotent_on_reparse(conn):
     )
     trade_kwargs = dict(
         filing_id=filing_id,
+        source_row_number=1,
         ticker="UHS",
         asset_name="Universal Health Services, Inc. Common Stock",
         asset_type="Stock",
@@ -175,6 +178,46 @@ def test_insert_trade_is_idempotent_on_reparse(conn):
     assert first_id is not None
     assert second_result is None
     assert len(models.get_trades_for_filing(conn, filing_id)) == 1
+
+
+def test_insert_trade_keeps_distinct_rows_identical_on_every_business_field(conn):
+    """Regression test for a real bug: a Whitehouse filing had two dependent children
+    each buy the same stock, same day, same amount bracket, both with an empty comment -
+    completely legitimate distinct transactions indistinguishable on any business field.
+    Dedup must key on source_row_number, not a composite of ticker/date/type/amount/owner,
+    or the second transaction is silently dropped as a false "duplicate"."""
+    leg_id = models.get_or_create_legislator(conn, "Sheldon", "Whitehouse", "senate", "member")
+    filing_id = models.insert_filing(
+        conn,
+        legislator_id=leg_id,
+        chamber="senate",
+        external_filing_id="abc-456",
+        filing_type="ptr",
+        is_amendment=False,
+        filing_date="2016-08-01",
+        source_url="https://efdsearch.senate.gov/search/view/ptr/abc-456/",
+        document_format="html",
+        fetched_at="2026-09-05T00:00:00",
+    )
+    identical_fields = dict(
+        filing_id=filing_id,
+        ticker="WM",
+        asset_name="Waste Management, Inc.",
+        asset_type="Stock",
+        transaction_type="purchase",
+        transaction_date="2016-07-07",
+        notification_date="2016-08-01",
+        amount_low=1001,
+        amount_high=15000,
+        owner="dependent_child",
+        comment=None,
+    )
+    first_id = models.insert_trade(conn, source_row_number=10, **identical_fields)
+    second_id = models.insert_trade(conn, source_row_number=11, **identical_fields)
+    assert first_id is not None
+    assert second_id is not None
+    assert first_id != second_id
+    assert len(models.get_trades_for_filing(conn, filing_id)) == 2
 
 
 def test_insert_trade_from_real_pelosi_filing_point_value_amount(conn):
@@ -195,6 +238,7 @@ def test_insert_trade_from_real_pelosi_filing_point_value_amount(conn):
     trade_id = models.insert_trade(
         conn,
         filing_id=filing_id,
+        source_row_number=1,
         ticker="RBLX",
         asset_name="Roblox Corporation Class A (RBLX) [OP]",
         asset_type="Stock Option",
@@ -231,6 +275,7 @@ def test_invalid_transaction_type_rejected(conn):
         models.insert_trade(
             conn,
             filing_id=filing_id,
+            source_row_number=1,
             asset_name="X Corp",
             transaction_type="gift",
             transaction_date="2026-01-01",

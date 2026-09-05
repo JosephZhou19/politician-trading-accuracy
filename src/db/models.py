@@ -52,6 +52,7 @@ class Filing:
 class Trade:
     id: int
     filing_id: int
+    source_row_number: int
     ticker: Optional[str]
     asset_name: str
     asset_type: Optional[str]
@@ -168,6 +169,7 @@ def insert_trade(
     conn: sqlite3.Connection,
     *,
     filing_id: int,
+    source_row_number: int,
     asset_name: str,
     transaction_type: str,
     transaction_date: str,
@@ -180,24 +182,28 @@ def insert_trade(
     comment: Optional[str] = None,
     raw_row_text: Optional[str] = None,
 ) -> Optional[int]:
-    """Insert a trade line; returns None instead of inserting if the natural key already
-    exists (expected on a re-parse). Checks explicitly rather than using INSERT OR IGNORE,
-    which would also swallow a CHECK violation from a bad transaction_type/owner value."""
+    """Insert a trade line; returns None instead of inserting if (filing_id,
+    source_row_number) already exists (expected on a re-parse). Dedup is keyed on the
+    source's own row position, not a composite of business fields - two distinct
+    transactions (e.g. two dependent children each buying the same stock on the same day
+    for the same amount) can be identical on every business field, so a composite key
+    would silently drop one as a "duplicate". Checks explicitly rather than using INSERT
+    OR IGNORE, which would also swallow a CHECK violation from a bad transaction_type/
+    owner value."""
     existing = conn.execute(
-        """SELECT id FROM trades
-           WHERE filing_id = ? AND asset_name = ? AND transaction_date = ?
-             AND transaction_type = ? AND amount_low = ? AND owner = ?""",
-        (filing_id, asset_name, transaction_date, transaction_type, amount_low, owner),
+        "SELECT id FROM trades WHERE filing_id = ? AND source_row_number = ?",
+        (filing_id, source_row_number),
     ).fetchone()
     if existing:
         return None
     cur = conn.execute(
-        """INSERT INTO trades (filing_id, ticker, asset_name, asset_type,
+        """INSERT INTO trades (filing_id, source_row_number, ticker, asset_name, asset_type,
                                 transaction_type, transaction_date, notification_date,
                                 amount_low, amount_high, owner, comment, raw_row_text)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             filing_id,
+            source_row_number,
             ticker,
             asset_name,
             asset_type,

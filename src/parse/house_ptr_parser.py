@@ -184,10 +184,13 @@ def parse_filing(pdf_path):
     date_match = SIGNED_DATE_RE.search(full_text)
 
     trades = []
-    for row in raw_rows:
+    for i, row in enumerate(raw_rows, start=1):
         ticker, asset_type = _extract_ticker_and_asset_type(row["asset_raw"])
         amount_low, amount_high = _parse_amount(row["amount_raw"])
         trades.append({
+            # House's PDF "ID" column is always blank in practice, unlike Senate's - parse
+            # order is the closest thing to a row identifier this source gives us
+            "source_row_number": i,
             "ticker": ticker,
             "asset_name": row["asset_raw"],
             "asset_type": asset_type,

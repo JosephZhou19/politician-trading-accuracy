@@ -45,9 +45,17 @@ CREATE INDEX IF NOT EXISTS idx_filings_legislator_id ON filings (legislator_id);
 -- spellings/codes onto these values. asset_type is free text rather than a CHECK enum
 -- since the official code list is large. raw_row_text is a catch-all for source-specific
 -- fields not otherwise modeled (e.g. House's cap-gains-over-$200 flag).
+--
+-- source_row_number (the source's own "#" column for Senate, or parse order for House,
+-- which has no equivalent) is the dedup key, not a composite of business fields - a real
+-- Whitehouse filing had two dependent children each buy the same stock, same day, same
+-- amount bracket, both with an empty comment: completely legitimate distinct transactions
+-- that are indistinguishable on ticker/date/type/amount/owner/comment alone. A composite
+-- key silently dropped the second one as a "duplicate", losing real trade data.
 CREATE TABLE IF NOT EXISTS trades (
     id                 INTEGER PRIMARY KEY,
     filing_id          INTEGER NOT NULL REFERENCES filings (id),
+    source_row_number  INTEGER NOT NULL,
     ticker             TEXT,
     asset_name         TEXT NOT NULL,
     asset_type         TEXT,
@@ -61,7 +69,7 @@ CREATE TABLE IF NOT EXISTS trades (
                              ('self', 'spouse', 'joint', 'dependent_child')),
     comment            TEXT,
     raw_row_text       TEXT,
-    UNIQUE (filing_id, asset_name, transaction_date, transaction_type, amount_low, owner)
+    UNIQUE (filing_id, source_row_number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_filing_id ON trades (filing_id);
