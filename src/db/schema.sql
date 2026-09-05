@@ -1,7 +1,5 @@
 -- Congressional Trading Disclosure Ingestor
 -- SQLite schema — Phase 1 (ingestion)
---
--- `trades` is intentionally not in this file yet — still being designed.
 
 PRAGMA foreign_keys = ON;
 
@@ -40,3 +38,39 @@ CREATE TABLE IF NOT EXISTS filings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_filings_legislator_id ON filings (legislator_id);
+
+-- One row per transaction line item within a filing. transaction_type and owner are
+-- canonicalized here (both sources use different spellings/codes for the same values -
+-- e.g. Senate spells out "Sale (Full)", House uses single-letter codes); that mapping
+-- happens in the parser, not the DB. asset_type is left as free text rather than a CHECK
+-- enum since the official asset-type code list is large (dozens of values) and not worth
+-- hardcoding here.
+CREATE TABLE IF NOT EXISTS trades (
+    id                 INTEGER PRIMARY KEY,
+    filing_id          INTEGER NOT NULL REFERENCES filings (id),
+    ticker             TEXT,           -- nullable: some foreign ADRs are filed with no ticker
+                                        -- in this field even though one appears in asset_name
+    asset_name         TEXT NOT NULL,
+    asset_type         TEXT,
+    transaction_type   TEXT NOT NULL CHECK (transaction_type IN
+                             ('purchase', 'sale_full', 'sale_partial', 'exchange')),
+    transaction_date   TEXT NOT NULL,  -- ISO 8601 date
+    notification_date  TEXT NOT NULL,  -- ISO 8601 date
+    amount_low         INTEGER NOT NULL,
+    amount_high        INTEGER,        -- nullable: the top disclosure bracket is open-ended
+                                        -- (e.g. "$50,000,001+"); equals amount_low for a
+                                        -- point-value amount (e.g. options expiring worthless)
+    owner              TEXT NOT NULL CHECK (owner IN
+                             ('self', 'spouse', 'joint', 'dependent_child')),
+    comment            TEXT,
+    raw_row_text       TEXT,           -- full raw text of this transaction line, catch-all
+                                        -- for source-specific fields not otherwise modeled
+                                        -- (e.g. House's cap-gains-over-$200 flag, per-row
+                                        -- filing status) since Phase 3 scoring doesn't need
+                                        -- them but they shouldn't be silently discarded
+    UNIQUE (filing_id, asset_name, transaction_date, transaction_type, amount_low, owner)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trades_filing_id ON trades (filing_id);
+CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades (ticker);
+CREATE INDEX IF NOT EXISTS idx_trades_transaction_date ON trades (transaction_date);
