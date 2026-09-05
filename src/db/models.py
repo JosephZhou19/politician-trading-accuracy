@@ -82,10 +82,7 @@ def get_or_create_legislator(
     chamber: str,
     filer_status: str,
 ) -> int:
-    """Look up a legislator by (first_name, last_name, chamber); insert if not found.
-
-    This is the only identity key the source data actually gives us - see PLAN.md.
-    """
+    """Look up a legislator by (first_name, last_name, chamber); insert if not found."""
     first_name = first_name.strip()
     last_name = last_name.strip()
     row = conn.execute(
@@ -129,11 +126,8 @@ def insert_filing(
     raw_file_path: Optional[str] = None,
     raw_doc_hash: Optional[str] = None,
 ) -> int:
-    """Insert a new filing. Callers should check get_filing_by_external_id first -
-    this raises sqlite3.IntegrityError on a duplicate (chamber, external_filing_id)
-    rather than silently ignoring it, since that would indicate the caller skipped
-    the existence check it needed to decide whether to fetch/parse this document at all.
-    """
+    """Insert a new filing. Raises sqlite3.IntegrityError on a duplicate - callers should
+    check get_filing_by_external_id first to decide whether to fetch/parse at all."""
     cur = conn.execute(
         """INSERT INTO filings (legislator_id, chamber, external_filing_id, filing_type,
                                  is_amendment, filing_date, source_url, document_format,
@@ -186,16 +180,9 @@ def insert_trade(
     comment: Optional[str] = None,
     raw_row_text: Optional[str] = None,
 ) -> Optional[int]:
-    """Insert a trade line, checked against the natural key (filing_id, asset_name,
-    transaction_date, transaction_type, amount_low, owner) since re-parsing the same filing
-    is expected to hit the same rows again - that's not a bug the way a duplicate filing
-    would be. Returns None if the row already existed instead of being inserted.
-
-    This deliberately does NOT use "INSERT OR IGNORE": that suppresses every constraint
-    violation, not just the duplicate-key one, which would silently swallow a bad
-    transaction_type/owner value from a parser bug instead of raising. Checking for the
-    duplicate explicitly first, then doing a plain INSERT, keeps CHECK violations loud.
-    """
+    """Insert a trade line; returns None instead of inserting if the natural key already
+    exists (expected on a re-parse). Checks explicitly rather than using INSERT OR IGNORE,
+    which would also swallow a CHECK violation from a bad transaction_type/owner value."""
     existing = conn.execute(
         """SELECT id FROM trades
            WHERE filing_id = ? AND asset_name = ? AND transaction_date = ?
