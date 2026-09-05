@@ -1,0 +1,24 @@
+# Local planning doc (not for the repo)
+PLAN.md
+
+# Data — never committed, private/local only
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Env / secrets
+.env
+
+# OS
+.DS_Store
+Thumbs.db
