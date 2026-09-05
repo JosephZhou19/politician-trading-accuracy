@@ -38,7 +38,7 @@ class Filing:
     external_filing_id: str
     filing_type: str
     is_amendment: bool
-    filing_date: str
+    filing_date: Optional[str]
     source_url: str
     document_format: str
     raw_file_path: Optional[str]
@@ -120,10 +120,10 @@ def insert_filing(
     external_filing_id: str,
     filing_type: str,
     is_amendment: bool,
-    filing_date: str,
     source_url: str,
     document_format: str,
     fetched_at: str,
+    filing_date: Optional[str] = None,
     raw_file_path: Optional[str] = None,
     raw_doc_hash: Optional[str] = None,
 ) -> int:
@@ -226,3 +226,41 @@ def get_trades_for_filing(conn: sqlite3.Connection, filing_id: int) -> list[Trad
         "SELECT * FROM trades WHERE filing_id = ? ORDER BY id", (filing_id,)
     ).fetchall()
     return [_row_to_trade(row) for row in rows]
+
+
+def delete_trades_for_filing(conn: sqlite3.Connection, filing_id: int) -> None:
+    """Clear a filing's trades before re-parsing it (retrying a 'pending'/'failed' filing
+    reuses the existing filing row rather than inserting a new one, since (chamber,
+    external_filing_id) is unique - so its old trades need clearing first)."""
+    conn.execute("DELETE FROM trades WHERE filing_id = ?", (filing_id,))
+    conn.commit()
+
+
+def start_ingestion_run(conn: sqlite3.Connection, chamber: str, started_at: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO ingestion_runs (chamber, started_at, status) VALUES (?, ?, 'running')",
+        (chamber, started_at),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def finish_ingestion_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    finished_at: str,
+    filings_found: int,
+    filings_new: int,
+    filings_failed: int,
+    status: str,
+    error_message: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """UPDATE ingestion_runs
+           SET finished_at = ?, filings_found = ?, filings_new = ?, filings_failed = ?,
+               status = ?, error_message = ?
+           WHERE id = ?""",
+        (finished_at, filings_found, filings_new, filings_failed, status, error_message, run_id),
+    )
+    conn.commit()

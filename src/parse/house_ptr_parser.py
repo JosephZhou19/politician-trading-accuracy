@@ -28,6 +28,18 @@ STATUS_RE = re.compile(r"Status:\s*(\S+)")
 SIGNED_DATE_RE = re.compile(r"Digitally Signed:.*?,\s*(\d{2}/\d{2}/\d{4})")
 
 
+class UnparseableFormError(Exception):
+    """Raised when a PDF isn't the modern generated PTR form this parser handles.
+
+    Some House filings - even recent ones - are legacy hand-filled forms submitted on
+    paper and scanned in (some "HAND DELIVERED"-stamped, some with no text layer at all),
+    rather than the digitally-generated PTR. Same situation as Senate's paper filings:
+    a different form entirely, not a bug in this parser, and OCR/legacy-form support is
+    future work. "Filing ID #" appears in every modern-format PDF observed so far and is
+    the cheapest reliable signal that this one isn't.
+    """
+
+
 def _clean(text):
     # small-caps glyphs in section labels (Filing Status, Description, ...) decode to
     # NUL bytes for every letter but the first
@@ -175,9 +187,12 @@ def _to_iso_date(mmddyyyy):
 
 
 def parse_filing(pdf_path):
-    """Parse a House PTR PDF into filer status, filing date, and canonicalized trades."""
+    """Parse a House PTR PDF into filer status, filing date, and canonicalized trades.
+    Raises UnparseableFormError if this isn't the modern generated form."""
     with pdfplumber.open(pdf_path) as pdf:
         full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        if "Filing ID" not in full_text:
+            raise UnparseableFormError(f"no 'Filing ID' marker found in {pdf_path}")
         raw_rows = _extract_raw_rows(pdf)
 
     status_match = STATUS_RE.search(full_text)

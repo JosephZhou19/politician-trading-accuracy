@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS filings (
     external_filing_id  TEXT NOT NULL,
     filing_type         TEXT NOT NULL CHECK (filing_type IN ('ptr', 'annual', 'other')),
     is_amendment        INTEGER NOT NULL DEFAULT 0 CHECK (is_amendment IN (0, 1)),
-    filing_date         TEXT NOT NULL,
+    filing_date         TEXT,  -- nullable: a needs_ocr filing's real date genuinely isn't
+                                -- known yet (e.g. House's scanned legacy paper forms give
+                                -- no reliable machine-readable date) - a guessed value
+                                -- would be worse than admitting we don't know
     source_url          TEXT NOT NULL,
     document_format     TEXT NOT NULL CHECK (document_format IN ('html', 'pdf', 'image')),
     raw_file_path       TEXT,
@@ -75,3 +78,18 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_filing_id ON trades (filing_id);
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades (ticker);
 CREATE INDEX IF NOT EXISTS idx_trades_transaction_date ON trades (transaction_date);
+
+-- One row per scraper invocation, for observability once ingestion runs unattended on a
+-- schedule: when did it last run, how much was new, what failed.
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    id              INTEGER PRIMARY KEY,
+    chamber         TEXT NOT NULL CHECK (chamber IN ('house', 'senate')),
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT,
+    filings_found   INTEGER,
+    filings_new     INTEGER,
+    filings_failed  INTEGER,
+    status          TEXT NOT NULL DEFAULT 'running'
+                        CHECK (status IN ('running', 'completed', 'failed')),
+    error_message   TEXT
+);

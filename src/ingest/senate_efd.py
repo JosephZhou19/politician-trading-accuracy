@@ -1,6 +1,7 @@
 """Scraper for Senate eFD financial disclosure filings (efdsearch.senate.gov)."""
 
 import hashlib
+import logging
 import re
 import time
 from datetime import datetime, timezone
@@ -12,6 +13,13 @@ from bs4 import BeautifulSoup
 
 from src.db import models
 from src.parse import senate_ptr_parser
+
+logger = logging.getLogger(__name__)
+
+# A filing at one of these statuses is done - re-running the scraper skips it. 'needs_ocr'
+# counts as done for now since there's no OCR step to retry into yet; 'pending'/'failed'
+# mean a previous run started but never finished, so those get retried.
+DONE_STATUSES = {"parsed", "needs_ocr"}
 
 BASE_URL = "https://efdsearch.senate.gov"
 HOME_URL = BASE_URL + "/search/home/"
@@ -126,6 +134,63 @@ def fetch_report_html(session, href):
     return resp.text
 
 
+def _process_paper_filing(conn, parsed, legislator_id, source_url, now, existing_filing_id):
+    if existing_filing_id is None:
+        filing_id = models.insert_filing(
+            conn,
+            legislator_id=legislator_id,
+            chamber="senate",
+            external_filing_id=parsed["external_filing_id"],
+            filing_type="ptr",
+            is_amendment=parsed["is_amendment"],
+            filing_date=parsed["filing_date"],
+            source_url=source_url,
+            document_format="image",
+            fetched_at=now,
+        )
+    else:
+        filing_id = existing_filing_id
+    models.update_filing_parse_status(conn, filing_id, "needs_ocr")
+    return filing_id
+
+
+def _process_electronic_filing(session, conn, html_dir, parsed, legislator_id, source_url, now, existing_filing_id):
+    """Download, parse, and store one electronic PTR. Raises on any failure - the caller
+    marks the filing 'failed' and moves on, so one bad filing can't take down an
+    hours-long bulk run."""
+    html = fetch_report_html(session, parsed["href"])
+    html_file = html_dir / f"{parsed['external_filing_id']}.html"
+    html_file.write_text(html, encoding="utf-8")
+
+    if existing_filing_id is None:
+        filing_id = models.insert_filing(
+            conn,
+            legislator_id=legislator_id,
+            chamber="senate",
+            external_filing_id=parsed["external_filing_id"],
+            filing_type="ptr",
+            is_amendment=parsed["is_amendment"],
+            filing_date=parsed["filing_date"],
+            source_url=source_url,
+            document_format="html",
+            fetched_at=now,
+            raw_file_path=str(html_file),
+            raw_doc_hash=hashlib.sha256(html.encode("utf-8")).hexdigest(),
+        )
+    else:
+        filing_id = existing_filing_id
+        models.delete_trades_for_filing(conn, filing_id)
+
+    for trade in senate_ptr_parser.parse_report_html(html):
+        trade["notification_date"] = parsed["filing_date"]
+        models.insert_trade(conn, filing_id=filing_id, **trade)
+
+    models.update_filing_parse_status(
+        conn, filing_id, "parsed", parsed_at=datetime.now(timezone.utc).isoformat()
+    )
+    return filing_id
+
+
 def ingest_ptrs(conn, data_dir, filer_types=(FILER_TYPE_SENATOR,), last_name=""):
     """Search PTRs for the given filer types and write legislators/filings/trades.
 
@@ -133,11 +198,15 @@ def ingest_ptrs(conn, data_dir, filer_types=(FILER_TYPE_SENATOR,), last_name="")
     parse_status='needs_ocr' and no trades, rather than skipped outright - skipping
     them would silently make ~28% of Senate PTRs (and 27 senators who file exclusively
     on paper) disappear from any comparison. Actually OCR-ing them is future work.
+
+    One bad filing is logged and skipped rather than stopping the whole run - check
+    `failures` in the returned summary, or `SELECT * FROM filings WHERE parse_status =
+    'failed'`, to see what needs attention.
     """
     html_dir = Path(data_dir) / "raw" / "senate"
     html_dir.mkdir(parents=True, exist_ok=True)
     session = new_session()
-    summary = {"found": 0, "new": 0, "skipped": 0, "paper": 0}
+    summary = {"found": 0, "new": 0, "skipped": 0, "paper": 0, "failed": 0, "failures": []}
 
     for filer_type in filer_types:
         filer_status = FILER_TYPE_TO_STATUS[filer_type]
@@ -145,7 +214,8 @@ def ingest_ptrs(conn, data_dir, filer_types=(FILER_TYPE_SENATOR,), last_name="")
             parsed = parse_row(row)
             summary["found"] += 1
 
-            if models.get_filing_by_external_id(conn, "senate", parsed["external_filing_id"]):
+            existing = models.get_filing_by_external_id(conn, "senate", parsed["external_filing_id"])
+            if existing and existing.parse_status in DONE_STATUSES:
                 summary["skipped"] += 1
                 continue
 
@@ -154,51 +224,25 @@ def ingest_ptrs(conn, data_dir, filer_types=(FILER_TYPE_SENATOR,), last_name="")
             )
             now = datetime.now(timezone.utc).isoformat()
             source_url = urljoin(BASE_URL, parsed["href"])
+            existing_id = existing.id if existing else None
 
-            if parsed["is_paper"]:
-                filing_id = models.insert_filing(
-                    conn,
-                    legislator_id=legislator_id,
-                    chamber="senate",
-                    external_filing_id=parsed["external_filing_id"],
-                    filing_type="ptr",
-                    is_amendment=parsed["is_amendment"],
-                    filing_date=parsed["filing_date"],
-                    source_url=source_url,
-                    document_format="image",
-                    fetched_at=now,
+            try:
+                if parsed["is_paper"]:
+                    _process_paper_filing(conn, parsed, legislator_id, source_url, now, existing_id)
+                    summary["paper"] += 1
+                else:
+                    _process_electronic_filing(
+                        session, conn, html_dir, parsed, legislator_id, source_url, now, existing_id
+                    )
+                    summary["new"] += 1
+            except Exception as e:
+                logger.warning(
+                    "Failed to process Senate PTR %s: %r", parsed["external_filing_id"], e
                 )
-                models.update_filing_parse_status(conn, filing_id, "needs_ocr")
-                summary["paper"] += 1
-                continue
-
-            html = fetch_report_html(session, parsed["href"])
-            html_file = html_dir / f"{parsed['external_filing_id']}.html"
-            html_file.write_text(html, encoding="utf-8")
-
-            filing_id = models.insert_filing(
-                conn,
-                legislator_id=legislator_id,
-                chamber="senate",
-                external_filing_id=parsed["external_filing_id"],
-                filing_type="ptr",
-                is_amendment=parsed["is_amendment"],
-                filing_date=parsed["filing_date"],
-                source_url=source_url,
-                document_format="html",
-                fetched_at=now,
-                raw_file_path=str(html_file),
-                raw_doc_hash=hashlib.sha256(html.encode("utf-8")).hexdigest(),
-            )
-
-            for trade in senate_ptr_parser.parse_report_html(html):
-                trade["notification_date"] = parsed["filing_date"]
-                models.insert_trade(conn, filing_id=filing_id, **trade)
-
-            models.update_filing_parse_status(
-                conn, filing_id, "parsed", parsed_at=datetime.now(timezone.utc).isoformat()
-            )
-            summary["new"] += 1
+                if existing_id:
+                    models.update_filing_parse_status(conn, existing_id, "failed")
+                summary["failed"] += 1
+                summary["failures"].append((parsed["external_filing_id"], repr(e)))
             time.sleep(REQUEST_DELAY_SECONDS)
 
     return summary

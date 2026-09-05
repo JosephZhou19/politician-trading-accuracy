@@ -283,3 +283,95 @@ def test_invalid_transaction_type_rejected(conn):
             amount_low=1,
             owner="self",
         )
+
+
+def _insert_filing_with_trade(conn):
+    leg_id = models.get_or_create_legislator(conn, "Alan", "Armstrong", "senate", "member")
+    filing_id = models.insert_filing(
+        conn,
+        legislator_id=leg_id,
+        chamber="senate",
+        external_filing_id="abc-123",
+        filing_type="ptr",
+        is_amendment=False,
+        filing_date="2026-07-21",
+        source_url="https://efdsearch.senate.gov/search/view/ptr/abc-123/",
+        document_format="html",
+        fetched_at="2026-09-05T00:00:00",
+    )
+    models.insert_trade(
+        conn,
+        filing_id=filing_id,
+        source_row_number=1,
+        asset_name="X Corp",
+        transaction_type="purchase",
+        transaction_date="2026-01-01",
+        notification_date="2026-01-01",
+        amount_low=1,
+        owner="self",
+    )
+    return filing_id
+
+
+def test_delete_trades_for_filing_clears_only_that_filing(conn):
+    filing_id = _insert_filing_with_trade(conn)
+    assert len(models.get_trades_for_filing(conn, filing_id)) == 1
+
+    models.delete_trades_for_filing(conn, filing_id)
+    assert len(models.get_trades_for_filing(conn, filing_id)) == 0
+
+
+def test_delete_trades_for_filing_does_not_touch_other_filings(conn):
+    leg_id = models.get_or_create_legislator(conn, "Alan", "Armstrong", "senate", "member")
+    filing_kwargs = dict(
+        legislator_id=leg_id,
+        chamber="senate",
+        filing_type="ptr",
+        is_amendment=False,
+        filing_date="2026-07-21",
+        document_format="html",
+        fetched_at="2026-09-05T00:00:00",
+    )
+    filing_a = models.insert_filing(
+        conn, external_filing_id="abc-1", source_url="https://x/abc-1/", **filing_kwargs
+    )
+    filing_b = models.insert_filing(
+        conn, external_filing_id="abc-2", source_url="https://x/abc-2/", **filing_kwargs
+    )
+    trade_kwargs = dict(
+        asset_name="X Corp",
+        transaction_type="purchase",
+        transaction_date="2026-01-01",
+        notification_date="2026-01-01",
+        amount_low=1,
+        owner="self",
+    )
+    models.insert_trade(conn, filing_id=filing_a, source_row_number=1, **trade_kwargs)
+    models.insert_trade(conn, filing_id=filing_b, source_row_number=1, **trade_kwargs)
+
+    models.delete_trades_for_filing(conn, filing_a)
+    assert len(models.get_trades_for_filing(conn, filing_a)) == 0
+    assert len(models.get_trades_for_filing(conn, filing_b)) == 1
+
+
+def test_ingestion_run_round_trip(conn):
+    run_id = models.start_ingestion_run(conn, "house", "2026-09-05T00:00:00")
+    row = conn.execute("SELECT * FROM ingestion_runs WHERE id = ?", (run_id,)).fetchone()
+    assert row["status"] == "running"
+    assert row["finished_at"] is None
+
+    models.finish_ingestion_run(
+        conn,
+        run_id,
+        finished_at="2026-09-05T01:00:00",
+        filings_found=10,
+        filings_new=8,
+        filings_failed=1,
+        status="completed",
+    )
+    row = conn.execute("SELECT * FROM ingestion_runs WHERE id = ?", (run_id,)).fetchone()
+    assert row["status"] == "completed"
+    assert row["filings_found"] == 10
+    assert row["filings_new"] == 8
+    assert row["filings_failed"] == 1
+    assert row["finished_at"] == "2026-09-05T01:00:00"
