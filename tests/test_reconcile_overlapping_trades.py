@@ -90,6 +90,25 @@ def test_tied_filing_dates_are_left_unresolved(conn):
     assert models.get_trades_for_filing(conn, filing_b)[0].superseded_by_trade_id is None
 
 
+def test_matches_regardless_of_how_far_apart_the_filings_are(conn):
+    """Deliberate design decision, not an oversight: no date-proximity gate. A real
+    filing's transaction/filing dates can lag by years, so "filed close together" can't
+    reliably distinguish a genuine late re-filing from a coincidence - and transaction-date
+    range overlap is a no-op (the matched trade's own date is in both filings' ranges by
+    construction, so it never actually rejects anything). The match key itself (owner
+    pinned to one person, plus ticker/date/type/amount all coinciding) is the validated
+    signal - see the module docstring for the real-data evidence."""
+    leg_id = models.get_or_create_legislator(conn, "Sheldon", "Whitehouse", "senate", "member")
+    filing_early = _insert_filing(conn, leg_id, "f-early", "2014-01-01")
+    filing_late = _insert_filing(conn, leg_id, "f-late", "2020-12-31")
+    _insert_trade(conn, filing_early, 1, transaction_date="2013-12-15")
+    late_trade = _insert_trade(conn, filing_late, 1, transaction_date="2013-12-15")
+
+    summary = reconcile_overlapping_trades(conn)
+    assert summary["trades_superseded"] == 1
+    assert models.get_trades_for_filing(conn, filing_early)[0].superseded_by_trade_id == late_trade
+
+
 def test_ticker_less_trades_match_on_asset_name(conn):
     leg_id = models.get_or_create_legislator(conn, "Sheldon", "Whitehouse", "senate", "member")
     filing_early = _insert_filing(conn, leg_id, "f-early", "2016-09-09")

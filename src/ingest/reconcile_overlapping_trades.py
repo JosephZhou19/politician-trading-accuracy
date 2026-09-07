@@ -8,14 +8,29 @@ one already reported, alongside genuinely new ones. Matching key: (legislator, t
 asset_name, transaction_date, transaction_type, amount_low, amount_high, owner) across
 different filing_ids.
 
-Both owner and transaction_type MUST be part of the key. Verified on real data: dropping
-either produces dozens of false matches, since it's common and legitimate for self/spouse/
-joint accounts to trade the same stock for the same amount on the same day (mirrored
-household trading) - that looks identical to a duplicate if owner isn't checked.
+Owner and transaction_type MUST both be part of the match - verified necessary on real data,
+not assumed: dropping either produces dozens of false matches, since it's common and
+legitimate for self/spouse/joint accounts to trade the same stock for the same amount on the
+same day (mirrored household trading), which looks identical to a duplicate if owner isn't
+checked.
+
+Deliberately NOT gated on any date-proximity check (transaction-date range, or how close
+together the two filings were filed). Two attempts at that were tried and dropped:
+transaction-date overlap is a no-op (the matched trade's own date is by construction in both
+filings' ranges, so ranges always "overlap" whenever a match exists at all - it never
+actually rejects anything); and filing-date proximity is unreliable because real filings can
+be years late, so "filed close together" doesn't reliably distinguish a genuine re-filing
+from a coincidence. The match key itself (owner pinned to a specific person/account, AND
+ticker, AND exact date, AND type, AND amount bracket all independently coinciding) is strong
+enough evidence on its own: verified with zero false positives across Whitehouse's entire
+decade-plus trading history (~800+ trades, only the 4 real duplicates matched, no date
+filtering involved). Caveat worth re-checking once more legislators are in the DB: only
+validated against 3 legislators so far.
 
 This is a content-based heuristic, not metadata like the amendment case, so a tie (two
 candidate filings filed on the exact same date, no way to tell which is authoritative) is
-left unresolved rather than guessed.
+left unresolved rather than guessed - same philosophy as the amendment case's ambiguous
+groups.
 """
 
 import logging
