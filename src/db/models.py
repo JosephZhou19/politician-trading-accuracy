@@ -67,6 +67,7 @@ class Trade:
     owner: str
     comment: Optional[str]
     raw_row_text: Optional[str]
+    superseded_by_trade_id: Optional[int]
 
 
 def _row_to_filing(row: sqlite3.Row) -> Filing:
@@ -167,6 +168,14 @@ def set_superseded(conn: sqlite3.Connection, filing_id: int, superseded_by_filin
 
 def set_reconciliation_note(conn: sqlite3.Connection, filing_id: int, note: str) -> None:
     conn.execute("UPDATE filings SET reconciliation_note = ? WHERE id = ?", (note, filing_id))
+    conn.commit()
+
+
+def set_trade_superseded(conn: sqlite3.Connection, trade_id: int, superseded_by_trade_id: int) -> None:
+    conn.execute(
+        "UPDATE trades SET superseded_by_trade_id = ? WHERE id = ?",
+        (superseded_by_trade_id, trade_id),
+    )
     conn.commit()
 
 

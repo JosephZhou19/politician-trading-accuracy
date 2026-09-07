@@ -87,6 +87,13 @@ CREATE TABLE IF NOT EXISTS trades (
                              ('self', 'spouse', 'joint', 'dependent_child')),
     comment            TEXT,
     raw_row_text       TEXT,
+    -- Set by cross-filing overlap reconciliation (src/ingest/reconcile_overlapping_trades.py):
+    -- two unrelated filings (no amendment link) can both report the exact same real
+    -- transaction, e.g. one filing re-discloses a trade an earlier filing already covered
+    -- as part of a wider batch. Superseding happens per-trade, not per-filing like
+    -- amendments, since a filing with an overlap can still have other, genuinely unique
+    -- trades that must stay active.
+    superseded_by_trade_id INTEGER REFERENCES trades (id),
     UNIQUE (filing_id, source_row_number)
 );
 
