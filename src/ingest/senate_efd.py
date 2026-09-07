@@ -45,6 +45,11 @@ FILER_TYPE_TO_STATUS = {
 
 FILING_ID_RE = re.compile(r"/search/view/(?:ptr|paper)/([0-9a-fA-F-]+)/")
 AMENDMENT_RE = re.compile(r"\(Amendment", re.IGNORECASE)
+# Every report title is "...for MM/DD/YYYY[ (Amendment N)]" - for a normal filing this date
+# equals its own filing_date, but for an amendment it's the ORIGINAL's date being corrected
+# (confirmed against a real amendment document, which carries no other reference to what it
+# amends). This is the nominal_date used for amendment reconciliation - see schema.sql.
+REPORT_DATE_RE = re.compile(r"for\s+(\d{2}/\d{2}/\d{4})")
 
 
 def new_session():
@@ -117,14 +122,17 @@ def parse_row(row):
     first_name_raw, last_name_raw, _office_raw, link_html, date_str = row
     a = BeautifulSoup(link_html, "html.parser").find("a")
     href = a["href"]
+    link_text = a.get_text()
+    date_match = REPORT_DATE_RE.search(link_text)
     return {
         "first_name": first_name_raw.strip().split()[0] if first_name_raw.strip() else "",
         "last_name": last_name_raw.strip(),
         "href": href,
         "external_filing_id": FILING_ID_RE.search(href).group(1).lower(),
         "is_paper": "/search/view/paper/" in href,
-        "is_amendment": bool(AMENDMENT_RE.search(a.get_text())),
+        "is_amendment": bool(AMENDMENT_RE.search(link_text)),
         "filing_date": _to_iso_date(date_str.strip()),
+        "nominal_date": _to_iso_date(date_match.group(1)) if date_match else None,
     }
 
 
@@ -147,6 +155,7 @@ def _process_paper_filing(conn, parsed, legislator_id, source_url, now, existing
             source_url=source_url,
             document_format="image",
             fetched_at=now,
+            nominal_date=parsed["nominal_date"],
         )
     else:
         filing_id = existing_filing_id
@@ -176,6 +185,7 @@ def _process_electronic_filing(session, conn, html_dir, parsed, legislator_id, s
             fetched_at=now,
             raw_file_path=str(html_file),
             raw_doc_hash=hashlib.sha256(html.encode("utf-8")).hexdigest(),
+            nominal_date=parsed["nominal_date"],
         )
     else:
         filing_id = existing_filing_id

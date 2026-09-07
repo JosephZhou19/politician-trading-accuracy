@@ -39,6 +39,21 @@ CREATE TABLE IF NOT EXISTS filings (
     parsed_at           TEXT,
     parse_status        TEXT NOT NULL DEFAULT 'pending'
                              CHECK (parse_status IN ('pending', 'parsed', 'failed', 'needs_ocr')),
+    -- nominal_date, superseded_by_filing_id: amendment reconciliation. Senate report titles
+    -- say "for MM/DD/YYYY" - equal to filing_date for a normal filing, but for an amendment
+    -- it's the date of the ORIGINAL being corrected (confirmed against a real amendment
+    -- document - amendments carry no other reference to what they amend, not even the
+    -- original's ID). Grouping filings by (legislator, nominal_date) clusters an original
+    -- with all its amendments, since every amendment in a chain references the original's
+    -- date, not the previous amendment's. NULL on House filings - no equivalent reference is
+    -- exposed there, and no House PTR amendment has been observed to even exist (checked
+    -- 2020-2026 live) so there's nothing to reconcile yet.
+    nominal_date            TEXT,
+    superseded_by_filing_id INTEGER REFERENCES filings (id),
+    -- Free-text flag for anything reconciliation found but couldn't safely auto-resolve -
+    -- e.g. an amendment whose nominal_date matches more than one original filing, so which
+    -- one it corrects is genuinely undeterminable from the source data. NULL means clean.
+    reconciliation_note     TEXT,
     UNIQUE (chamber, external_filing_id)
 );
 
