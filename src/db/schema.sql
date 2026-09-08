@@ -49,6 +49,19 @@ CREATE TABLE IF NOT EXISTS filings (
     -- exposed there, and no House PTR amendment has been observed to even exist (checked
     -- 2020-2026 live) so there's nothing to reconcile yet.
     nominal_date            TEXT,
+    -- Precise "Filed MM/DD/YYYY @ H:MM AM/PM" timestamp from the report page itself, as
+    -- "YYYY-MM-DDTHH:MM" (Senate only). Needed because filing_date alone (a plain date) is
+    -- too coarse to order amendment chains correctly: confirmed on real data that three of
+    -- Whitehouse's amendments were all filed on the identical calendar day (9:41 AM, 3:42 PM,
+    -- 4:15 PM) - date-only ordering can't tell them apart. NULL for paper filings (no HTML
+    -- fetched) and all House filings.
+    filed_at                TEXT,
+    -- The explicit sequence number from "(Amendment N)" in the report title, when present.
+    -- Confirmed to run in ascending order of actual filing time (Whitehouse's Amendment
+    -- 1/2/3 were filed 9:41am/3:42pm/4:15pm the same day) - a direct signal from the source
+    -- itself, more authoritative than inferring order from filed_at. Older amendments just
+    -- say "(Amendment)" with no number; NULL for those and for non-amendment filings.
+    amendment_number        INTEGER,
     superseded_by_filing_id INTEGER REFERENCES filings (id),
     -- Free-text flag for anything reconciliation found but couldn't safely auto-resolve -
     -- e.g. an amendment whose nominal_date matches more than one original filing, so which

@@ -39,6 +39,25 @@ def _to_iso_date(mmddyyyy):
     return f"{year}-{month}-{day}"
 
 
+FILED_AT_RE = re.compile(r"Filed\s+(\d{2}/\d{2}/\d{4})\s*@\s*(\d{1,2}):(\d{2})\s*(AM|PM)")
+
+
+def parse_filed_at(html):
+    """Extract the precise "Filed MM/DD/YYYY @ H:MM AM/PM" timestamp from the report page,
+    as a sortable "YYYY-MM-DDTHH:MM" string (24-hour). This is meaningfully more precise
+    than the date-only value in search results - confirmed necessary on real data: three
+    of Whitehouse's amendments were all filed on the same calendar day, and only this
+    timestamp (9:41 AM, 3:42 PM, 4:15 PM) actually orders them. Returns None if not found."""
+    m = FILED_AT_RE.search(html)
+    if not m:
+        return None
+    date_str, hour_str, minute, meridiem = m.groups()
+    hour = int(hour_str) % 12
+    if meridiem == "PM":
+        hour += 12
+    return f"{_to_iso_date(date_str)}T{hour:02d}:{minute}"
+
+
 def parse_report_html(html):
     """Extract trade records from an electronic PTR page's transaction table.
 

@@ -47,6 +47,8 @@ class Filing:
     parsed_at: Optional[str]
     parse_status: str
     nominal_date: Optional[str]
+    filed_at: Optional[str]
+    amendment_number: Optional[int]
     superseded_by_filing_id: Optional[int]
     reconciliation_note: Optional[str]
 
@@ -131,14 +133,17 @@ def insert_filing(
     raw_file_path: Optional[str] = None,
     raw_doc_hash: Optional[str] = None,
     nominal_date: Optional[str] = None,
+    filed_at: Optional[str] = None,
+    amendment_number: Optional[int] = None,
 ) -> int:
     """Insert a new filing. Raises sqlite3.IntegrityError on a duplicate - callers should
     check get_filing_by_external_id first to decide whether to fetch/parse at all."""
     cur = conn.execute(
         """INSERT INTO filings (legislator_id, chamber, external_filing_id, filing_type,
                                  is_amendment, filing_date, source_url, document_format,
-                                 raw_file_path, raw_doc_hash, fetched_at, nominal_date)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                 raw_file_path, raw_doc_hash, fetched_at, nominal_date,
+                                 filed_at, amendment_number)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             legislator_id,
             chamber,
@@ -152,6 +157,8 @@ def insert_filing(
             raw_doc_hash,
             fetched_at,
             nominal_date,
+            filed_at,
+            amendment_number,
         ),
     )
     conn.commit()

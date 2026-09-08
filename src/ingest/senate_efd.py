@@ -45,6 +45,13 @@ FILER_TYPE_TO_STATUS = {
 
 FILING_ID_RE = re.compile(r"/search/view/(?:ptr|paper)/([0-9a-fA-F-]+)/")
 AMENDMENT_RE = re.compile(r"\(Amendment", re.IGNORECASE)
+# Modern amendments are explicitly numbered - "(Amendment 1)", "(Amendment 2)", etc. - and
+# confirmed to appear in ascending order of when they were actually filed (Whitehouse's
+# Amendment 1/2/3 were filed 9:41am/3:42pm/4:15pm the same day). This is a direct signal from
+# the source, more authoritative than inferring order from timestamps - see
+# reconcile_amendments.py. Older amendments just say "(Amendment)" with no number; those fall
+# back to filed_at/filing_date ordering.
+AMENDMENT_NUMBER_RE = re.compile(r"\(Amendment\s*(\d+)\)", re.IGNORECASE)
 # Every report title is "...for MM/DD/YYYY[ (Amendment N)]" - for a normal filing this date
 # equals its own filing_date, but for an amendment it's the ORIGINAL's date being corrected
 # (confirmed against a real amendment document, which carries no other reference to what it
@@ -124,6 +131,7 @@ def parse_row(row):
     href = a["href"]
     link_text = a.get_text()
     date_match = REPORT_DATE_RE.search(link_text)
+    number_match = AMENDMENT_NUMBER_RE.search(link_text)
     return {
         "first_name": first_name_raw.strip().split()[0] if first_name_raw.strip() else "",
         "last_name": last_name_raw.strip(),
@@ -133,6 +141,7 @@ def parse_row(row):
         "is_amendment": bool(AMENDMENT_RE.search(link_text)),
         "filing_date": _to_iso_date(date_str.strip()),
         "nominal_date": _to_iso_date(date_match.group(1)) if date_match else None,
+        "amendment_number": int(number_match.group(1)) if number_match else None,
     }
 
 
@@ -156,6 +165,7 @@ def _process_paper_filing(conn, parsed, legislator_id, source_url, now, existing
             document_format="image",
             fetched_at=now,
             nominal_date=parsed["nominal_date"],
+            amendment_number=parsed["amendment_number"],
         )
     else:
         filing_id = existing_filing_id
@@ -186,6 +196,8 @@ def _process_electronic_filing(session, conn, html_dir, parsed, legislator_id, s
             raw_file_path=str(html_file),
             raw_doc_hash=hashlib.sha256(html.encode("utf-8")).hexdigest(),
             nominal_date=parsed["nominal_date"],
+            filed_at=senate_ptr_parser.parse_filed_at(html),
+            amendment_number=parsed["amendment_number"],
         )
     else:
         filing_id = existing_filing_id
