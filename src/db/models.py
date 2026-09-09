@@ -69,7 +69,6 @@ class Trade:
     owner: str
     comment: Optional[str]
     raw_row_text: Optional[str]
-    superseded_by_trade_id: Optional[int]
 
 
 def _row_to_filing(row: sqlite3.Row) -> Filing:
@@ -178,14 +177,6 @@ def set_reconciliation_note(conn: sqlite3.Connection, filing_id: int, note: str)
     conn.commit()
 
 
-def set_trade_superseded(conn: sqlite3.Connection, trade_id: int, superseded_by_trade_id: int) -> None:
-    conn.execute(
-        "UPDATE trades SET superseded_by_trade_id = ? WHERE id = ?",
-        (superseded_by_trade_id, trade_id),
-    )
-    conn.commit()
-
-
 def update_filing_parse_status(
     conn: sqlite3.Connection,
     filing_id: int,
@@ -218,12 +209,9 @@ def insert_trade(
 ) -> Optional[int]:
     """Insert a trade line; returns None instead of inserting if (filing_id,
     source_row_number) already exists (expected on a re-parse). Dedup is keyed on the
-    source's own row position, not a composite of business fields - two distinct
-    transactions (e.g. two dependent children each buying the same stock on the same day
-    for the same amount) can be identical on every business field, so a composite key
-    would silently drop one as a "duplicate". Checks explicitly rather than using INSERT
-    OR IGNORE, which would also swallow a CHECK violation from a bad transaction_type/
-    owner value."""
+    source's own row position, not a composite of business fields, since two distinct
+    transactions can be identical on every one. Checks explicitly rather than using
+    INSERT OR IGNORE, which would also swallow a CHECK violation from bad data."""
     existing = conn.execute(
         "SELECT id FROM trades WHERE filing_id = ? AND source_row_number = ?",
         (filing_id, source_row_number),
@@ -263,9 +251,8 @@ def get_trades_for_filing(conn: sqlite3.Connection, filing_id: int) -> list[Trad
 
 
 def delete_trades_for_filing(conn: sqlite3.Connection, filing_id: int) -> None:
-    """Clear a filing's trades before re-parsing it (retrying a 'pending'/'failed' filing
-    reuses the existing filing row rather than inserting a new one, since (chamber,
-    external_filing_id) is unique - so its old trades need clearing first)."""
+    """Clear a filing's trades before re-parsing it (a retry reuses the existing filing
+    row, so its old trades need clearing first)."""
     conn.execute("DELETE FROM trades WHERE filing_id = ?", (filing_id,))
     conn.commit()
 

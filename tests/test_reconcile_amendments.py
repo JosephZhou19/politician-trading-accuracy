@@ -143,10 +143,8 @@ def test_rerun_is_idempotent_and_picks_up_new_amendment(conn):
 
 
 def test_ambiguous_group_resolved_by_trade_content(conn):
-    """Real case, from Boozman's actual data: two originals filed the same date (one all
-    sells, one all buys - a rebalance split across two submissions), amendment matches one
-    almost entirely and the other not at all. Content evidence resolves what the date
-    reference alone can't."""
+    """Two same-date originals, an amendment matching one almost entirely and the other
+    not at all - content evidence resolves what the date reference alone can't."""
     leg_id = models.get_or_create_legislator(conn, "John", "Boozman", "senate", "member")
     sells = _insert_filing(conn, leg_id, "sells", is_amendment=False, filing_date="2025-12-08", nominal_date="2025-12-08")
     buys = _insert_filing(conn, leg_id, "buys", is_amendment=False, filing_date="2025-12-08", nominal_date="2025-12-08")
@@ -197,9 +195,8 @@ def test_still_ambiguous_when_content_matches_both_candidates(conn):
 
 
 def test_amendment_beats_original_tied_on_same_filing_date(conn):
-    """Real case, from Whitehouse's data: an original and the amendment correcting it were
-    both recorded with the identical filing_date. Sorting by date alone makes this a coin
-    flip; the amendment must deterministically win regardless of list-construction order."""
+    """An original and its amendment recorded with the identical filing_date - the
+    amendment must deterministically win, not depend on list-construction order."""
     leg_id = models.get_or_create_legislator(conn, "John", "Boozman", "senate", "member")
     original = _insert_filing(conn, leg_id, "orig-1", is_amendment=False, filing_date="2026-06-16", nominal_date="2026-06-16")
     amendment = _insert_filing(conn, leg_id, "amend-1", is_amendment=True, filing_date="2026-06-16", nominal_date="2026-06-16")
@@ -211,10 +208,8 @@ def test_amendment_beats_original_tied_on_same_filing_date(conn):
 
 
 def test_filed_at_breaks_same_day_amendment_chain(conn):
-    """Real case, from Whitehouse's data: three separate amendments to the same original,
-    all recorded with the identical filing_date (one calendar day), only distinguishable by
-    the precise "Filed ... @ H:MM AM/PM" timestamp (9:41 AM, 3:42 PM, 4:15 PM). Without
-    filed_at, these would tie; with it, they resolve into a correctly ordered chain."""
+    """Three amendments to the same original, all sharing one filing_date - only the
+    precise filed_at timestamp orders them correctly."""
     leg_id = models.get_or_create_legislator(conn, "John", "Boozman", "senate", "member")
     original = _insert_filing(conn, leg_id, "orig-1", is_amendment=False, filing_date="2014-03-26", nominal_date="2014-03-26")
     amend1 = _insert_filing(conn, leg_id, "amend-1", is_amendment=True, filing_date="2015-08-13", nominal_date="2014-03-26", filed_at="2015-08-13T09:41")
@@ -250,11 +245,8 @@ def test_genuine_tie_is_flagged_not_guessed(conn):
 
 
 def test_explicit_amendment_number_is_authoritative_over_time(conn):
-    """Real case, from Whitehouse's data: Amendment 1/2/3 filed the same day at 9:41am/
-    3:42pm/4:15pm - filed_at already gets this right, but the explicit number is the more
-    direct, authoritative signal from the source itself, confirmed to run in ascending
-    filing-time order. Deliberately give amend-2 a LATER filed_at than amend-3 here, to
-    prove the number wins over time when both are present, not just agree with it by luck."""
+    """Give amend-2 a LATER filed_at than amend-3 to prove the explicit amendment number
+    wins over inferred time when both are present, not just agree with it by luck."""
     leg_id = models.get_or_create_legislator(conn, "Sheldon", "Whitehouse", "senate", "member")
     original = _insert_filing(conn, leg_id, "orig-1", is_amendment=False, filing_date="2014-03-26", nominal_date="2014-03-26")
     amend1 = _insert_filing(conn, leg_id, "amend-1", is_amendment=True, filing_date="2015-08-13", nominal_date="2014-03-26", filed_at="2015-08-13T09:41", amendment_number=1)

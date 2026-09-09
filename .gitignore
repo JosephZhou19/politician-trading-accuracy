@@ -8,6 +8,12 @@ data/
 *.sqlite
 *.sqlite3
 
+# Quiver Quantitative comparison dumps and the ad hoc script that reads them - not
+# part of the shipped pipeline, private scraped data
+scripts/compare_quiver.py
+quiver_*.txt
+sheldon_whitehouse.txt
+
 # Python
 __pycache__/
 *.py[cod]

@@ -174,11 +174,9 @@ def test_insert_trade_is_idempotent_on_reparse(conn):
 
 
 def test_insert_trade_keeps_distinct_rows_identical_on_every_business_field(conn):
-    """Regression test for a real bug: a Whitehouse filing had two dependent children
-    each buy the same stock, same day, same amount bracket, both with an empty comment -
-    completely legitimate distinct transactions indistinguishable on any business field.
-    Dedup must key on source_row_number, not a composite of ticker/date/type/amount/owner,
-    or the second transaction is silently dropped as a false "duplicate"."""
+    """Two distinct transactions can be identical on every business field (e.g. two
+    dependent children buying the same stock the same day for the same amount). Dedup
+    must key on source_row_number, or the second is silently dropped as a "duplicate"."""
     leg_id = models.get_or_create_legislator(conn, "Sheldon", "Whitehouse", "senate", "member")
     filing_id = models.insert_filing(
         conn,

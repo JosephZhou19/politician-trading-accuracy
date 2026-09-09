@@ -29,15 +29,10 @@ SIGNED_DATE_RE = re.compile(r"Digitally Signed:.*?,\s*(\d{2}/\d{2}/\d{4})")
 
 
 class UnparseableFormError(Exception):
-    """Raised when a PDF isn't the modern generated PTR form this parser handles.
-
-    Some House filings - even recent ones - are legacy hand-filled forms submitted on
-    paper and scanned in (some "HAND DELIVERED"-stamped, some with no text layer at all),
-    rather than the digitally-generated PTR. Same situation as Senate's paper filings:
-    a different form entirely, not a bug in this parser, and OCR/legacy-form support is
-    future work. "Filing ID #" appears in every modern-format PDF observed so far and is
-    the cheapest reliable signal that this one isn't.
-    """
+    """Raised when a PDF isn't the modern generated PTR form this parser handles - some
+    House filings are legacy hand-filled forms scanned to paper instead, a different form
+    entirely (same situation as Senate's paper filings; OCR support is future work).
+    "Filing ID #" is the cheapest reliable signal that a PDF isn't the modern format."""
 
 
 def _clean(text):

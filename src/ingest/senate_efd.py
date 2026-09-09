@@ -16,9 +16,8 @@ from src.parse import senate_ptr_parser
 
 logger = logging.getLogger(__name__)
 
-# A filing at one of these statuses is done - re-running the scraper skips it. 'needs_ocr'
-# counts as done for now since there's no OCR step to retry into yet; 'pending'/'failed'
-# mean a previous run started but never finished, so those get retried.
+# A filing at one of these statuses is done - re-running the scraper skips it.
+# 'pending'/'failed' mean a previous run started but never finished, so those get retried.
 DONE_STATUSES = {"parsed", "needs_ocr"}
 
 BASE_URL = "https://efdsearch.senate.gov"
@@ -28,9 +27,8 @@ USER_AGENT = "Mozilla/5.0 (research; contact josephzhou1234@gmail.com)"
 PAGE_SIZE = 100
 REQUEST_DELAY_SECONDS = 1
 
-# Verified against the live form's own <label> text, not visual layout order - an
-# earlier guess based on layout order got this wrong (thought 14 was Periodic
-# Transactions; it's actually Blind Trust).
+# Verified against the live form's <label> text - visual layout order gets this wrong
+# (14 is Blind Trust, not Periodic Transactions).
 REPORT_TYPE_PTR = 11
 
 # Verified against the live form's <label> text.
@@ -45,17 +43,14 @@ FILER_TYPE_TO_STATUS = {
 
 FILING_ID_RE = re.compile(r"/search/view/(?:ptr|paper)/([0-9a-fA-F-]+)/")
 AMENDMENT_RE = re.compile(r"\(Amendment", re.IGNORECASE)
-# Modern amendments are explicitly numbered - "(Amendment 1)", "(Amendment 2)", etc. - and
-# confirmed to appear in ascending order of when they were actually filed (Whitehouse's
-# Amendment 1/2/3 were filed 9:41am/3:42pm/4:15pm the same day). This is a direct signal from
-# the source, more authoritative than inferring order from timestamps - see
-# reconcile_amendments.py. Older amendments just say "(Amendment)" with no number; those fall
-# back to filed_at/filing_date ordering.
+# Modern amendments are explicitly numbered - "(Amendment 1)", "(Amendment 2)", etc. - in
+# ascending order of actual filing time, a more authoritative ordering signal than inferring
+# it from timestamps (see reconcile_amendments.py). Older amendments just say "(Amendment)"
+# with no number; those fall back to filed_at/filing_date ordering.
 AMENDMENT_NUMBER_RE = re.compile(r"\(Amendment\s*(\d+)\)", re.IGNORECASE)
-# Every report title is "...for MM/DD/YYYY[ (Amendment N)]" - for a normal filing this date
-# equals its own filing_date, but for an amendment it's the ORIGINAL's date being corrected
-# (confirmed against a real amendment document, which carries no other reference to what it
-# amends). This is the nominal_date used for amendment reconciliation - see schema.sql.
+# Every report title is "...for MM/DD/YYYY[ (Amendment N)]" - the filing's own date for a
+# normal filing, or the ORIGINAL's date for an amendment (amendments carry no other
+# reference to what they amend). This is the nominal_date used for reconciliation.
 REPORT_DATE_RE = re.compile(r"for\s+(\d{2}/\d{2}/\d{4})")
 
 

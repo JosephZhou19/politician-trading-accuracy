@@ -1,28 +1,28 @@
 """Reconciles Senate PTR amendments against the originals they correct.
 
 Senate report titles say "for MM/DD/YYYY" - equal to filing_date for a normal filing, but
-for an amendment it's the ORIGINAL's date (the only reference an amendment carries to what
-it corrects - confirmed against a real amendment document, which just restates every
-transaction with no pointer back to the original). Grouping filings by (legislator_id,
-nominal_date) clusters an original with all its amendments, since every amendment in a
-chain references the original's date, not the previous amendment's.
+for an amendment it's the ORIGINAL's date, the only reference an amendment carries to what
+it corrects. Grouping filings by (legislator_id, nominal_date) clusters an original with
+its whole amendment chain, since every amendment in a chain references the original's
+date, not the previous amendment's.
 
-Real case confirmed in Boozman's data: a legislator filed TWO originals on the same date
-(one all sells, one all buys - a rebalance split across two submissions) and later amended
-one of them. Metadata alone (nominal_date) can't say which - both originals share it. But
-the amendment's own trade content matched one candidate almost entirely (13 of 14 trades)
-and the other not at all, which is decisive evidence even though the date reference isn't.
-Using content this way also matters for correctness beyond just resolving the ambiguity:
-one of that amendment's 14 trades had its ticker corrected (RNWAX -> RNWGX) - a trade-level
-content match (see reconcile_overlapping_trades.py) can never catch that, since the ticker
-IS part of what changed. Resolving at the filing level sweeps up every trade in the
-superseded original, including the ones whose content the amendment corrected, not just the
-ones it restated unchanged.
+When an amendment's nominal_date matches more than one original (e.g. a rebalance split
+across two same-day submissions, one later amended), trade-content overlap picks which one
+it belongs to. Resolving at the filing level - not just the overlapping trades - matters
+because an amendment can also correct a trade's content (e.g. a ticker typo), which a
+trade-level match could never catch since the changed field is exactly what breaks the
+match.
 
-Re-runnable and incremental: already-superseded filings are excluded from re-consideration,
-so a later run only needs to look at whatever's still "current" plus anything new. House
-isn't handled here - no equivalent reference is exposed there, and no House PTR amendment
-has been observed to exist at all (checked 2020-2026 live).
+Content-matching here is deliberately scoped to amendments only: an explicit "(Amendment)"
+reference already proves the two filings are linked, and content just picks *which*
+original among several candidates - it never invents a link between filings that carry no
+such reference. A content-only mechanism for *unrelated* filings was tried and reverted:
+without a transaction-level timestamp, an identical-looking trade in two unrelated filings
+can't be proven to be a restatement rather than a genuinely separate second trade.
+
+Re-runnable and incremental: already-superseded filings are excluded from re-consideration.
+House isn't handled here - no equivalent reference is exposed there, and no House PTR
+amendment has been observed to exist at all.
 """
 
 import logging
@@ -34,8 +34,9 @@ logger = logging.getLogger(__name__)
 
 
 def _trade_keys_for_filing(conn, filing_id):
-    """Content key per trade in a filing, for matching against another filing's trades -
-    same shape as reconcile_overlapping_trades.py's matching key."""
+    """Content key per trade in a filing, used only to pick which original an amendment's
+    nominal_date-ambiguous group belongs to - never to link two filings that lack an
+    explicit amendment reference in the first place."""
     rows = conn.execute(
         """SELECT ticker, asset_name, transaction_date, transaction_type, amount_low,
                   amount_high, owner
@@ -51,20 +52,17 @@ def _trade_keys_for_filing(conn, filing_id):
 
 def _effective_time(m):
     """filed_at (precise "Filed ... @ H:MM AM/PM" timestamp) when available, falling back
-    to the coarser filing_date. Needed because filing_date alone can genuinely tie: three
-    real Whitehouse amendments were all filed on the identical calendar day, and only the
-    precise timestamp (9:41 AM, 3:42 PM, 4:15 PM) actually orders them."""
+    to the coarser filing_date, which can genuinely tie when multiple amendments are filed
+    the same calendar day."""
     return m["filed_at"] or m["filing_date"] or ""
 
 
 def _amendment_ranks(chain):
     """If every amendment in the chain has an explicit sequence number ("(Amendment N)"),
     rank the whole chain purely by that number - original = rank 0, Amendment N = rank N.
-    This is a direct instruction from the source (confirmed: Senate's own numbering runs in
-    ascending order of actual filing time), more authoritative than inferring order from
-    timestamps. Returns None if any amendment in the chain lacks a number, so the caller
-    falls back to time-based ordering - true of older amendments, which just say
-    "(Amendment)" with no number."""
+    A direct instruction from the source, more authoritative than inferring order from
+    timestamps. Returns None if any amendment in the chain lacks a number (true of older,
+    unnumbered amendments), so the caller falls back to time-based ordering."""
     ranks = {}
     for m in chain:
         if not m["is_amendment"]:
@@ -81,12 +79,8 @@ def _resolve_chain(conn, chain, summary):
     Preference order: (1) explicit amendment number, when every amendment in the chain has
     one; (2) effective filing time (filed_at, falling back to filing_date), with an
     amendment always outranking a non-amendment it ties with on time, since that's what an
-    amendment is *for* - a real, confirmed case: an original and the amendment correcting it
-    were both recorded with the identical filing_date. If the winning signal still ties
-    between two members (e.g. two amendments sharing both a number and the same effective
-    time - not observed, but not assumed away either), nothing is guessed: the whole chain
-    is left alone and flagged via reconciliation_note, same philosophy as the ambiguous-
-    original case."""
+    amendment is *for*. If the winning signal still ties between two members, nothing is
+    guessed: the whole chain is left alone and flagged via reconciliation_note."""
     ranks = _amendment_ranks(chain)
     if ranks is not None:
         key = lambda m: ranks[m["id"]]

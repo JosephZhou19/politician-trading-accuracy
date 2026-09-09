@@ -125,8 +125,7 @@ def _process_filing(conn, pdf_dir, row, existing_filing_id):
     try:
         parsed = house_ptr_parser.parse_filing(pdf_file)
     except house_ptr_parser.UnparseableFormError:
-        # Filer identity comes from the search row, unaffected by this. filer_status and
-        # filing_date aren't recoverable without OCR/legacy-form support, so filer_status
+        # filer_status/filing_date aren't recoverable without OCR support; filer_status
         # defaults to 'member' (PTRs are overwhelmingly filed by sitting members) rather
         # than being left unset, and filing_date stays NULL (a guess would be worse).
         legislator_id = models.get_or_create_legislator(
