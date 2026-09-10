@@ -77,6 +77,20 @@ GLUED_TICKER_WITH_CLASS_SUFFIX_ROW = """
 </tr>
 """
 
+BARE_TICKER_ROW = """
+<tr>
+    <td>11</td>
+    <td>10/23/2015</td>
+    <td>Child</td>
+    <td>--</td>
+    <td>DIS</td>
+    <td>Stock</td>
+    <td>Purchase</td>
+    <td>$1,001 - $15,000</td>
+    <td>--</td>
+</tr>
+"""
+
 STOCK_ROW = """
 <tr>
     <td>19</td>
@@ -136,6 +150,16 @@ def test_glued_ticker_with_share_class_suffix_recovered():
     trade = trades[0]
     assert trade["ticker"] == "BRK-B"
     assert trade["asset_name"] == "Berkshire Hathaway Inc Class B"
+
+
+def test_bare_ticker_with_no_company_name_recovered():
+    """Regression: some filers give no company name at all, just the bare ticker as the
+    whole asset name ("DIS"), with no ticker link either - confirmed against the raw
+    source, not a truncated name."""
+    trades = parse_report_html(TABLE_TEMPLATE.format(rows=BARE_TICKER_ROW))
+    trade = trades[0]
+    assert trade["ticker"] == "DIS"
+    assert trade["asset_name"] == "DIS"
 
 
 def test_mixed_bond_and_stock_rows_in_same_filing():

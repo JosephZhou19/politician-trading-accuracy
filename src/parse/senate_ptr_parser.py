@@ -34,6 +34,10 @@ NON_EQUITY_ASSET_TYPES = {"Corporate Bond", "Municipal Security"}
 # with the ticker glued onto the front of the asset name instead - e.g.
 # "STT-State Street Corporation" or "BRK-B - Berkshire Hathaway Inc Class B".
 GLUED_TICKER_RE = re.compile(r"^([A-Z]{1,6}(?:-[A-Z])?)\s*-\s*(.+)$")
+# Some filers give no company name at all, just the bare ticker as the entire asset name
+# (e.g. "DIS") with no ticker link either - confirmed against the raw source, not a
+# truncated company name.
+BARE_TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
 
 
 def _parse_amount(amount_raw):
@@ -105,6 +109,8 @@ def parse_report_html(html):
             glued_match = GLUED_TICKER_RE.match(asset_name)
             if glued_match:
                 ticker, asset_name = glued_match.group(1), glued_match.group(2)
+            elif BARE_TICKER_RE.match(asset_name):
+                ticker = asset_name
 
         raw_row_text = None
         if asset_type in NON_EQUITY_ASSET_TYPES:
