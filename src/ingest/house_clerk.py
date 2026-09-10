@@ -79,9 +79,12 @@ def external_filing_id(pdf_path):
 def parse_house_name(name_raw):
     """Split the search result's 'Last, Hon.. First Middle' name into (first, last).
     The comma unambiguously separates last name from first+middle, unlike the PDF's
-    own 'Hon. First Middle Last' field where the last-name boundary is ambiguous."""
+    own 'Hon. First Middle Last' field where the last-name boundary is ambiguous.
+    Title is usually "Hon.." but at least one real filing used "Mrs.." instead -
+    without stripping it too, "Mrs.." gets parsed as the first name, creating a
+    duplicate legislator row for the same person."""
     last_name, _, rest = name_raw.partition(",")
-    rest = re.sub(r"^\s*Hon\.+\s*", "", rest.strip())
+    rest = re.sub(r"^\s*(?:Hon|Mrs|Mr|Ms|Dr)\.+\s*", "", rest.strip())
     first_name = rest.split()[0] if rest else ""
     return first_name, last_name.strip()
 

@@ -30,6 +30,11 @@ OWNER_MAP = {
 # matching, so ticker is only trusted for asset types outside this set.
 NON_EQUITY_ASSET_TYPES = {"Corporate Bond", "Municipal Security"}
 
+# The ticker-link cell is occasionally empty ("--") for what's still a real equity trade,
+# with the ticker glued onto the front of the asset name instead - e.g.
+# "STT-State Street Corporation" or "BRK-B - Berkshire Hathaway Inc Class B".
+GLUED_TICKER_RE = re.compile(r"^([A-Z]{1,6}(?:-[A-Z])?)\s*-\s*(.+)$")
+
 
 def _parse_amount(amount_raw):
     parts = re.findall(r"\$[\d,]+(?:\.\d+)?", amount_raw)
@@ -96,6 +101,11 @@ def parse_report_html(html):
         asset_name = asset_cell.get_text(strip=True)
 
         ticker = ticker_text if asset_type not in NON_EQUITY_ASSET_TYPES else None
+        if ticker is None and asset_type not in NON_EQUITY_ASSET_TYPES:
+            glued_match = GLUED_TICKER_RE.match(asset_name)
+            if glued_match:
+                ticker, asset_name = glued_match.group(1), glued_match.group(2)
+
         raw_row_text = None
         if asset_type in NON_EQUITY_ASSET_TYPES:
             parts = [p for p in (bond_detail, f"source ticker link: {ticker_text}" if ticker_text else None) if p]

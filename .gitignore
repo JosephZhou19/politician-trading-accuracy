@@ -13,6 +13,9 @@ data/
 scripts/compare_quiver.py
 quiver_*.txt
 sheldon_whitehouse.txt
+nancy_pelosi.txt
+josh_gottheimer.txt
+marjorie_taylor_greene.txt
 
 # Python
 __pycache__/

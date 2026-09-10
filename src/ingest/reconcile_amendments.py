@@ -21,8 +21,9 @@ without a transaction-level timestamp, an identical-looking trade in two unrelat
 can't be proven to be a restatement rather than a genuinely separate second trade.
 
 Re-runnable and incremental: already-superseded filings are excluded from re-consideration.
-House isn't handled here - no equivalent reference is exposed there, and no House PTR
-amendment has been observed to exist at all.
+
+House amendments are reconciled separately, at the trade level - see
+reconcile_house_amendments below.
 """
 
 import logging
@@ -172,5 +173,87 @@ def reconcile_senate_amendments(conn):
 
         # Zero or one original plus one or more amendments in a chain.
         _resolve_chain(conn, members, summary)
+
+    return summary
+
+
+def _candidate_originals(conn, amended):
+    """Trades this amended row could be correcting: same legislator, an earlier filing (by
+    filing_date - undated filings are excluded rather than guessed at), not already spoken
+    for by another amendment, matching on ticker/date/type/owner/amount but not
+    asset_type/asset_name, which is what a correction actually changes (e.g. AllianceBernstein
+    reclassified [ST] -> [OL] with the same ticker). Ticker is included in the match despite
+    that risk: amount is a coarse bracket, not an exact figure, so two unrelated same-day
+    trades in one filing can otherwise collide into the same bucket and produce a false tie."""
+    return conn.execute(
+        """
+        SELECT tr.id FROM trades tr JOIN filings fl ON tr.filing_id = fl.id
+        WHERE fl.legislator_id = ? AND fl.chamber = 'house'
+          AND tr.id != ? AND tr.filing_id != ?
+          AND tr.superseded_by_trade_id IS NULL
+          AND tr.ticker IS ? AND tr.transaction_date = ? AND tr.transaction_type = ?
+          AND tr.owner = ? AND tr.amount_low = ? AND tr.amount_high IS ?
+          AND fl.filing_date IS NOT NULL AND fl.filing_date <= ?
+        """,
+        (
+            amended["legislator_id"], amended["id"], amended["filing_id"], amended["ticker"],
+            amended["transaction_date"], amended["transaction_type"], amended["owner"],
+            amended["amount_low"], amended["amount_high"], amended["filing_date"],
+        ),
+    ).fetchall()
+
+
+def reconcile_house_amendments(conn):
+    """Mark superseded House trades (trades.superseded_by_trade_id). Unlike Senate, a House
+    amendment carries no reference to what it corrects beyond the row's own content. When
+    content matching finds more than one equally-valid candidate (e.g. the original itself
+    has two rows identical on every matchable field), nothing is guessed: both candidates are
+    left alone and the amendment is flagged via reconciliation_note instead.
+
+    Re-runnable and incremental: an amended trade already resolved or already flagged is
+    skipped. Returns a summary dict."""
+    amended_trades = conn.execute(
+        """
+        SELECT t.id, t.filing_id, t.ticker, t.transaction_date, t.transaction_type, t.owner,
+               t.amount_low, t.amount_high, t.reconciliation_note, f.legislator_id, f.filing_date
+        FROM trades t JOIN filings f ON t.filing_id = f.id
+        WHERE f.chamber = 'house' AND t.filing_status = 'amended'
+        """
+    ).fetchall()
+
+    summary = {"resolved": 0, "ambiguous": 0, "no_match": 0, "skipped_already_processed": 0}
+
+    for amended in amended_trades:
+        if amended["reconciliation_note"] is not None:
+            summary["skipped_already_processed"] += 1
+            continue
+        already_resolved = conn.execute(
+            "SELECT 1 FROM trades WHERE superseded_by_trade_id = ?", (amended["id"],)
+        ).fetchone()
+        if already_resolved:
+            summary["skipped_already_processed"] += 1
+            continue
+
+        candidates = _candidate_originals(conn, amended)
+
+        if len(candidates) == 1:
+            models.set_trade_superseded(conn, candidates[0]["id"], amended["id"])
+            summary["resolved"] += 1
+        elif len(candidates) == 0:
+            note = (
+                f"no earlier trade found matching this amendment's content "
+                f"(legislator_id {amended['legislator_id']}, {amended['transaction_date']}, "
+                f"{amended['transaction_type']}, {amended['amount_low']}-{amended['amount_high']})"
+            )
+            models.set_trade_reconciliation_note(conn, amended["id"], note)
+            summary["no_match"] += 1
+        else:
+            note = (
+                f"ambiguous: {len(candidates)} earlier trades match this amendment's content; "
+                f"cannot determine which one it corrects"
+            )
+            models.set_trade_reconciliation_note(conn, amended["id"], note)
+            logger.warning("House amendment reconciliation ambiguous: trade %d - %s", amended["id"], note)
+            summary["ambiguous"] += 1
 
     return summary

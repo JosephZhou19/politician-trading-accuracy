@@ -49,6 +49,34 @@ MUNI_ROW_NO_TICKER = """
 </tr>
 """
 
+GLUED_TICKER_ROW = """
+<tr>
+    <td>5</td>
+    <td>04/12/2016</td>
+    <td>Child</td>
+    <td>--</td>
+    <td>STT-State Street Corporation</td>
+    <td>Stock</td>
+    <td>Sale (Partial)</td>
+    <td>$15,001 - $50,000</td>
+    <td>--</td>
+</tr>
+"""
+
+GLUED_TICKER_WITH_CLASS_SUFFIX_ROW = """
+<tr>
+    <td>1</td>
+    <td>07/24/2025</td>
+    <td>Joint</td>
+    <td>--</td>
+    <td>BRK-B - Berkshire Hathaway Inc Class B</td>
+    <td>Stock</td>
+    <td>Purchase</td>
+    <td>$1,001 - $15,000</td>
+    <td>--</td>
+</tr>
+"""
+
 STOCK_ROW = """
 <tr>
     <td>19</td>
@@ -92,6 +120,22 @@ def test_stock_ticker_still_parsed_normally():
     assert trade["ticker"] == "GILD"
     assert trade["asset_name"] == "Gilead Sciences, Inc."
     assert trade["raw_row_text"] is None
+
+
+def test_glued_ticker_recovered_when_ticker_link_missing():
+    """Regression: found via Quiver comparison - the ticker-link cell is sometimes empty
+    ("--") for a real stock trade, with the ticker glued onto the asset name instead."""
+    trades = parse_report_html(TABLE_TEMPLATE.format(rows=GLUED_TICKER_ROW))
+    trade = trades[0]
+    assert trade["ticker"] == "STT"
+    assert trade["asset_name"] == "State Street Corporation"
+
+
+def test_glued_ticker_with_share_class_suffix_recovered():
+    trades = parse_report_html(TABLE_TEMPLATE.format(rows=GLUED_TICKER_WITH_CLASS_SUFFIX_ROW))
+    trade = trades[0]
+    assert trade["ticker"] == "BRK-B"
+    assert trade["asset_name"] == "Berkshire Hathaway Inc Class B"
 
 
 def test_mixed_bond_and_stock_rows_in_same_filing():

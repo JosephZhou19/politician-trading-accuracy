@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS trades (
                              ('self', 'spouse', 'joint', 'dependent_child')),
     comment            TEXT,
     raw_row_text       TEXT,
+    -- Per-transaction "Filing Status" (New/Amended) from the House electronic system - NULL
+    -- for Senate, which reconciles at the filing level instead (see reconcile_amendments.py).
+    filing_status           TEXT,
+    superseded_by_trade_id  INTEGER REFERENCES trades (id),
+    reconciliation_note     TEXT,
     UNIQUE (filing_id, source_row_number)
 );
 

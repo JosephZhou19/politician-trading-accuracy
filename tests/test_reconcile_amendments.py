@@ -1,5 +1,5 @@
 from src.db import models
-from src.ingest.reconcile_amendments import reconcile_senate_amendments
+from src.ingest.reconcile_amendments import reconcile_house_amendments, reconcile_senate_amendments
 
 
 def _insert_filing(conn, legislator_id, ext_id, *, is_amendment, filing_date, nominal_date,
@@ -290,3 +290,143 @@ def test_two_amendments_with_the_same_number_is_flagged(conn):
     assert summary["filings_superseded"] == 0
     for ext_id in ("orig-1", "amend-1", "amend-2"):
         assert models.get_filing_by_external_id(conn, "senate", ext_id).superseded_by_filing_id is None
+
+
+def _insert_house_filing(conn, legislator_id, ext_id, *, filing_date):
+    return models.insert_filing(
+        conn,
+        legislator_id=legislator_id,
+        chamber="house",
+        external_filing_id=ext_id,
+        filing_type="ptr",
+        is_amendment=False,
+        filing_date=filing_date,
+        source_url=f"https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{ext_id}.pdf",
+        document_format="pdf",
+        fetched_at="2026-09-09T00:00:00",
+    )
+
+
+def _insert_house_trade(conn, filing_id, row_num, *, filing_status, ticker="AB",
+                         transaction_date="2021-01-27", transaction_type="purchase",
+                         amount_low=250001, amount_high=500000, owner="spouse"):
+    return models.insert_trade(
+        conn,
+        filing_id=filing_id,
+        source_row_number=row_num,
+        ticker=ticker,
+        asset_name=f"{ticker} Corp",
+        transaction_type=transaction_type,
+        transaction_date=transaction_date,
+        notification_date=transaction_date,
+        amount_low=amount_low,
+        amount_high=amount_high,
+        owner=owner,
+        filing_status=filing_status,
+    )
+
+
+def test_house_amendment_resolves_to_single_matching_original(conn):
+    leg_id = models.get_or_create_legislator(conn, "Nancy", "Pelosi", "house", "member")
+    original_filing = _insert_house_filing(conn, leg_id, "20018011", filing_date="2021-01-21")
+    original_trade_id = _insert_house_trade(conn, original_filing, 1, filing_status="new", ticker="AB")
+    amend_filing = _insert_house_filing(conn, leg_id, "20018539", filing_date="2021-04-09")
+    amend_trade_id = _insert_house_trade(conn, amend_filing, 1, filing_status="amended", ticker="AB")
+
+    summary = reconcile_house_amendments(conn)
+    assert summary == {"resolved": 1, "ambiguous": 0, "no_match": 0, "skipped_already_processed": 0}
+
+    trades = {t.id: t for t in models.get_trades_for_filing(conn, original_filing)}
+    assert trades[original_trade_id].superseded_by_trade_id == amend_trade_id
+
+
+def test_house_amendment_ticker_match_avoids_false_ambiguity_from_amount_bucket_collision(conn):
+    """Regression: without ticker in the match, an unrelated same-day, same-bracket trade
+    (DIS) in the original filing falsely collided with an AB amendment that only changed
+    asset_type, not ticker."""
+    leg_id = models.get_or_create_legislator(conn, "Nancy", "Pelosi", "house", "member")
+    original_filing = _insert_house_filing(conn, leg_id, "20018011", filing_date="2021-01-21")
+    ab_trade_id = _insert_house_trade(conn, original_filing, 1, filing_status="new", ticker="AB")
+    _insert_house_trade(conn, original_filing, 2, filing_status="new", ticker="DIS")
+    amend_filing = _insert_house_filing(conn, leg_id, "20018539", filing_date="2021-04-09")
+    amend_trade_id = _insert_house_trade(conn, amend_filing, 1, filing_status="amended", ticker="AB")
+
+    summary = reconcile_house_amendments(conn)
+    assert summary == {"resolved": 1, "ambiguous": 0, "no_match": 0, "skipped_already_processed": 0}
+    trades = {t.id: t for t in models.get_trades_for_filing(conn, original_filing)}
+    assert trades[ab_trade_id].superseded_by_trade_id == amend_trade_id
+
+
+def test_house_amendment_ambiguous_when_original_has_duplicate_rows(conn):
+    """The Visa 08/07/2019 case: the original filing itself discloses the same trade twice
+    (a filer data-entry duplicate), so one amendment row matches two equally-valid
+    candidates. Neither should be guessed-superseded."""
+    leg_id = models.get_or_create_legislator(conn, "Nancy", "Pelosi", "house", "member")
+    original_filing = _insert_house_filing(conn, leg_id, "20012288", filing_date="2019-09-18")
+    dup1 = _insert_house_trade(conn, original_filing, 1, filing_status="new", ticker="V")
+    dup2 = _insert_house_trade(conn, original_filing, 2, filing_status="new", ticker="V")
+    amend_filing = _insert_house_filing(conn, leg_id, "20012343", filing_date="2019-09-19")
+    amend_trade_id = _insert_house_trade(conn, amend_filing, 1, filing_status="amended", ticker="V")
+
+    summary = reconcile_house_amendments(conn)
+    assert summary == {"resolved": 0, "ambiguous": 1, "no_match": 0, "skipped_already_processed": 0}
+
+    trades = {t.id: t for t in models.get_trades_for_filing(conn, original_filing)}
+    assert trades[dup1].superseded_by_trade_id is None
+    assert trades[dup2].superseded_by_trade_id is None
+    amend_trade = models.get_trades_for_filing(conn, amend_filing)[0]
+    assert amend_trade.id == amend_trade_id
+    assert "ambiguous" in amend_trade.reconciliation_note
+
+
+def test_house_amendment_no_match_is_flagged(conn):
+    leg_id = models.get_or_create_legislator(conn, "Nancy", "Pelosi", "house", "member")
+    amend_filing = _insert_house_filing(conn, leg_id, "20099999", filing_date="2022-01-01")
+    _insert_house_trade(conn, amend_filing, 1, filing_status="amended")
+
+    summary = reconcile_house_amendments(conn)
+    assert summary == {"resolved": 0, "ambiguous": 0, "no_match": 1, "skipped_already_processed": 0}
+    amend_trade = models.get_trades_for_filing(conn, amend_filing)[0]
+    assert "no earlier trade" in amend_trade.reconciliation_note
+
+
+def test_house_amendment_does_not_cross_legislators(conn):
+    pelosi_id = models.get_or_create_legislator(conn, "Nancy", "Pelosi", "house", "member")
+    other_id = models.get_or_create_legislator(conn, "Marjorie", "Greene", "house", "member")
+    other_filing = _insert_house_filing(conn, other_id, "20018011", filing_date="2021-01-21")
+    _insert_house_trade(conn, other_filing, 1, filing_status="new")
+    amend_filing = _insert_house_filing(conn, pelosi_id, "20018539", filing_date="2021-04-09")
+    _insert_house_trade(conn, amend_filing, 1, filing_status="amended")
+
+    summary = reconcile_house_amendments(conn)
+    assert summary["resolved"] == 0
+    assert summary["no_match"] == 1
+
+
+def test_house_amendment_ignores_later_filing_with_matching_content(conn):
+    """A candidate that happens to match on content but was filed AFTER the amendment can't
+    be what the amendment corrects - excluding it avoids a false-positive match."""
+    leg_id = models.get_or_create_legislator(conn, "Nancy", "Pelosi", "house", "member")
+    amend_filing = _insert_house_filing(conn, leg_id, "20018539", filing_date="2021-04-09")
+    _insert_house_trade(conn, amend_filing, 1, filing_status="amended")
+    later_filing = _insert_house_filing(conn, leg_id, "20099999", filing_date="2021-05-01")
+    _insert_house_trade(conn, later_filing, 1, filing_status="new")
+
+    summary = reconcile_house_amendments(conn)
+    assert summary == {"resolved": 0, "ambiguous": 0, "no_match": 1, "skipped_already_processed": 0}
+
+
+def test_house_amendment_reconciliation_is_idempotent(conn):
+    leg_id = models.get_or_create_legislator(conn, "Nancy", "Pelosi", "house", "member")
+    original_filing = _insert_house_filing(conn, leg_id, "20018011", filing_date="2021-01-21")
+    original_trade_id = _insert_house_trade(conn, original_filing, 1, filing_status="new")
+    amend_filing = _insert_house_filing(conn, leg_id, "20018539", filing_date="2021-04-09")
+    amend_trade_id = _insert_house_trade(conn, amend_filing, 1, filing_status="amended")
+
+    first = reconcile_house_amendments(conn)
+    second = reconcile_house_amendments(conn)
+    assert first == {"resolved": 1, "ambiguous": 0, "no_match": 0, "skipped_already_processed": 0}
+    assert second == {"resolved": 0, "ambiguous": 0, "no_match": 0, "skipped_already_processed": 1}
+
+    trades = {t.id: t for t in models.get_trades_for_filing(conn, original_filing)}
+    assert trades[original_trade_id].superseded_by_trade_id == amend_trade_id

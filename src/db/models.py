@@ -18,7 +18,22 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA_PATH.read_text())
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive columns added after a DB already existed - CREATE TABLE IF NOT EXISTS in
+    schema.sql only creates missing tables, it doesn't retrofit columns onto one that's
+    already there."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
+    if "filing_status" not in existing:
+        conn.execute("ALTER TABLE trades ADD COLUMN filing_status TEXT")
+    if "superseded_by_trade_id" not in existing:
+        conn.execute("ALTER TABLE trades ADD COLUMN superseded_by_trade_id INTEGER REFERENCES trades(id)")
+    if "reconciliation_note" not in existing:
+        conn.execute("ALTER TABLE trades ADD COLUMN reconciliation_note TEXT")
+    conn.commit()
 
 
 @dataclass
@@ -69,6 +84,9 @@ class Trade:
     owner: str
     comment: Optional[str]
     raw_row_text: Optional[str]
+    filing_status: Optional[str]
+    superseded_by_trade_id: Optional[int]
+    reconciliation_note: Optional[str]
 
 
 def _row_to_filing(row: sqlite3.Row) -> Filing:
@@ -177,6 +195,11 @@ def set_reconciliation_note(conn: sqlite3.Connection, filing_id: int, note: str)
     conn.commit()
 
 
+def set_filing_date(conn: sqlite3.Connection, filing_id: int, filing_date: str) -> None:
+    conn.execute("UPDATE filings SET filing_date = ? WHERE id = ?", (filing_date, filing_id))
+    conn.commit()
+
+
 def update_filing_parse_status(
     conn: sqlite3.Connection,
     filing_id: int,
@@ -206,6 +229,7 @@ def insert_trade(
     amount_high: Optional[int] = None,
     comment: Optional[str] = None,
     raw_row_text: Optional[str] = None,
+    filing_status: Optional[str] = None,
 ) -> Optional[int]:
     """Insert a trade line; returns None instead of inserting if (filing_id,
     source_row_number) already exists (expected on a re-parse). Dedup is keyed on the
@@ -221,8 +245,9 @@ def insert_trade(
     cur = conn.execute(
         """INSERT INTO trades (filing_id, source_row_number, ticker, asset_name, asset_type,
                                 transaction_type, transaction_date, notification_date,
-                                amount_low, amount_high, owner, comment, raw_row_text)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                amount_low, amount_high, owner, comment, raw_row_text,
+                                filing_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             filing_id,
             source_row_number,
@@ -237,10 +262,24 @@ def insert_trade(
             owner,
             comment,
             raw_row_text,
+            filing_status,
         ),
     )
     conn.commit()
     return cur.lastrowid
+
+
+def set_trade_superseded(conn: sqlite3.Connection, trade_id: int, superseded_by_trade_id: int) -> None:
+    conn.execute(
+        "UPDATE trades SET superseded_by_trade_id = ? WHERE id = ?",
+        (superseded_by_trade_id, trade_id),
+    )
+    conn.commit()
+
+
+def set_trade_reconciliation_note(conn: sqlite3.Connection, trade_id: int, note: str) -> None:
+    conn.execute("UPDATE trades SET reconciliation_note = ? WHERE id = ?", (note, trade_id))
+    conn.commit()
 
 
 def get_trades_for_filing(conn: sqlite3.Connection, filing_id: int) -> list[Trade]:
