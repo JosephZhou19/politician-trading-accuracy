@@ -11,7 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from src.db import models
-from src.parse import house_ptr_parser
+from src.parse import house_ptr_parser, sanity_checks
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +161,9 @@ def _process_filing(conn, pdf_dir, row, existing_filing_id):
     models.update_filing_parse_status(
         conn, filing_id, "parsed", parsed_at=datetime.now(timezone.utc).isoformat()
     )
+    issues = sanity_checks.validate_trades(parsed["trades"])
+    if issues:
+        models.set_reconciliation_note(conn, filing_id, "; ".join(issues))
     return "parsed"
 
 

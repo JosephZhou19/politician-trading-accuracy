@@ -47,6 +47,39 @@ def test_filing_round_trip(conn):
     assert fetched.parse_status == "pending"
 
 
+def _insert_test_filing(conn, external_filing_id="abc-123"):
+    leg_id = models.get_or_create_legislator(conn, "Alan", "Armstrong", "senate", "member")
+    return models.insert_filing(
+        conn,
+        legislator_id=leg_id,
+        chamber="senate",
+        external_filing_id=external_filing_id,
+        filing_type="ptr",
+        is_amendment=False,
+        filing_date="2026-07-21",
+        source_url="https://efdsearch.senate.gov/search/view/ptr/abc-123/",
+        document_format="html",
+        fetched_at="2026-09-05T00:00:00",
+    )
+
+
+def test_set_reconciliation_note_appends_rather_than_overwrites(conn):
+    filing_id = _insert_test_filing(conn)
+    models.set_reconciliation_note(conn, filing_id, "first note")
+    models.set_reconciliation_note(conn, filing_id, "second note")
+    note = models.get_filing_by_external_id(conn, "senate", "abc-123").reconciliation_note
+    assert "first note" in note
+    assert "second note" in note
+
+
+def test_set_reconciliation_note_does_not_duplicate_same_note(conn):
+    filing_id = _insert_test_filing(conn)
+    models.set_reconciliation_note(conn, filing_id, "same note")
+    models.set_reconciliation_note(conn, filing_id, "same note")
+    note = models.get_filing_by_external_id(conn, "senate", "abc-123").reconciliation_note
+    assert note.count("same note") == 1
+
+
 def test_insert_filing_raises_on_duplicate(conn):
     leg_id = models.get_or_create_legislator(conn, "Alan", "Armstrong", "senate", "member")
     kwargs = dict(

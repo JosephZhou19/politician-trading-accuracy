@@ -191,7 +191,18 @@ def set_superseded(conn: sqlite3.Connection, filing_id: int, superseded_by_filin
 
 
 def set_reconciliation_note(conn: sqlite3.Connection, filing_id: int, note: str) -> None:
-    conn.execute("UPDATE filings SET reconciliation_note = ? WHERE id = ?", (note, filing_id))
+    """Appends to any existing note rather than overwriting it - a filing can be flagged by
+    more than one independent check (e.g. an ingest-time sanity check and a later amendment
+    reconciliation pass), and the first flag shouldn't silently disappear. Skips appending a
+    note that's already present, so a repeated run of an idempotent check doesn't grow it
+    without bound."""
+    existing = conn.execute(
+        "SELECT reconciliation_note FROM filings WHERE id = ?", (filing_id,)
+    ).fetchone()[0]
+    if existing and note in existing:
+        return
+    combined = f"{existing} | {note}" if existing else note
+    conn.execute("UPDATE filings SET reconciliation_note = ? WHERE id = ?", (combined, filing_id))
     conn.commit()
 
 

@@ -75,6 +75,11 @@ def _derive_columns(pdf):
         if not all(k in found for k in ("owner", "asset", "type", "notification", "amount")):
             continue
 
+        # The real "Cap. Gains" column always sits right of "amount" - a match left of it is
+        # "cap" appearing inside a data row's own asset name (e.g. a municipal bond), not a header.
+        if "cap" in found and found["cap"] <= found["amount"]:
+            del found["cap"]
+
         # "Date" appears twice - once for the transaction-date column (between "type"
         # and "notification"), once redundantly stacked under "notification" itself
         # for "Notification Date". Only the first one is a new column boundary.
@@ -253,7 +258,8 @@ def _extract_ticker_and_asset_type(asset_raw):
 
 
 def _parse_amount(amount_raw):
-    parts = re.findall(r"\$[\d,]+(?:\.\d+)?", amount_raw)
+    # Also matches a bare-cents value with no leading zero, e.g. "$.01".
+    parts = re.findall(r"\$(?:[\d,]+(?:\.\d+)?|\.\d+)", amount_raw)
     if not parts:
         return None, None
     low = int(float(parts[0].replace("$", "").replace(",", "")))

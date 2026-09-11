@@ -1,9 +1,10 @@
 """Full-history ingestion pipeline for both chambers.
 
 Safe to run repeatedly (e.g. on a daily schedule) - both scrapers skip anything already
-successfully parsed, so a re-run only fetches genuinely new filings. See PLAN.md for the
-recommended way to schedule this (Windows Task Scheduler) - this script itself has no
-scheduling logic, it's a single pass.
+successfully parsed, so a re-run only fetches genuinely new filings. Each chamber's amendment
+reconciliation runs right after its ingest pass, so newly-arrived amendments never sit
+unreconciled between runs. See PLAN.md for the recommended way to schedule this (Windows Task
+Scheduler) - this script itself has no scheduling logic, it's a single pass.
 
 Usage:
     python -m src.ingest.run_all
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from src.db import models
 from src.ingest import house_clerk, senate_efd
+from src.ingest.reconcile_amendments import reconcile_house_amendments, reconcile_senate_amendments
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,8 @@ def run_house(conn, data_dir, start_year, end_year):
             logger.info("House %d: %s", year, {k: v for k, v in summary.items() if k != "failures"})
             for key in totals:
                 totals[key] += summary[key]
+        reconcile_summary = reconcile_house_amendments(conn)
+        logger.info("House amendment reconciliation: %s", reconcile_summary)
         status = "completed"
     except Exception as e:
         logger.exception("House ingestion aborted")
@@ -80,6 +84,8 @@ def run_senate(conn, data_dir):
         logger.info("Senate: %s", {k: v for k, v in summary.items() if k != "failures"})
         for key in totals:
             totals[key] += summary[key]
+        reconcile_summary = reconcile_senate_amendments(conn)
+        logger.info("Senate amendment reconciliation: %s", reconcile_summary)
         status = "completed"
     except Exception as e:
         logger.exception("Senate ingestion aborted")

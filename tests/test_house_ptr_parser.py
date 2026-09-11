@@ -23,6 +23,7 @@ from src.parse.house_ptr_parser import (
     _extract_filing_status,
     _extract_raw_rows,
     _extract_ticker_and_asset_type,
+    _parse_amount,
     _to_iso_date,
     parse_filing,
 )
@@ -219,6 +220,40 @@ def test_extract_rows_legacy_case_corrupted_layout():
     assert row["owner_raw"] == "sP"
     assert row["type_raw"] == "s"
     assert row["date"] == "12/21/2017"
+
+
+# Real coordinates from a 2016 Mo Brooks filing (20004382.pdf) with no real "Cap. Gains"
+# column - "CaP" is just part of the asset name "NORTH CAROLINA CAP FACS FIN AGY...".
+FALSE_CAP_DATA_ROW = [
+    _word("JT", 63.0, 73.2, 329.0),
+    _word("NORTH", 102.0, 134.8, 329.0),
+    _word("CaROlINa", 137.0, 183.7, 329.0),
+    _word("CaP", 185.88, 203.187, 329.0),
+    _word("FaCs", 205.4, 227.7, 329.0),
+    _word("P", 267.8, 272.8, 329.0),
+    _word("01/7/2016", 333.0, 375.0, 329.0),
+    _word("01/7/2016", 385.5, 427.4, 329.0),
+    _word("$1,001", 450.8, 478.6, 329.0),
+    _word("-", 480.8, 484.1, 329.0),
+    _word("$15,000", 486.3, 519.8, 329.0),
+]
+
+
+def test_derive_columns_ignores_cap_word_in_data_row_asset_name():
+    """Regression: "cap" inside an asset name was wrongly claimed as the cap-column header,
+    inverting amount's boundaries and dropping every row's amount."""
+    pdf = FakePDF([FakePage(LEGACY_HEADER_WORDS + FALSE_CAP_DATA_ROW)])
+    columns = _derive_columns(pdf)
+    assert columns is not None
+    rows = _extract_raw_rows(pdf, columns)
+    assert len(rows) == 1
+    assert rows[0]["amount_raw"] == "$1,001 - $15,000"
+
+
+def test_parse_amount_leading_dot_no_zero():
+    """Regression: bare-cents amounts with no leading zero ("$.01", "$.25")."""
+    assert _parse_amount("$.01") == (0, 0)
+    assert _parse_amount("$.25") == (0, 0)
 
 
 def test_ticker_and_asset_type_with_bracket():

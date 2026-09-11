@@ -12,7 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from src.db import models
-from src.parse import senate_ptr_parser
+from src.parse import sanity_checks, senate_ptr_parser
 
 logger = logging.getLogger(__name__)
 
@@ -198,13 +198,17 @@ def _process_electronic_filing(session, conn, html_dir, parsed, legislator_id, s
         filing_id = existing_filing_id
         models.delete_trades_for_filing(conn, filing_id)
 
-    for trade in senate_ptr_parser.parse_report_html(html):
+    trades = senate_ptr_parser.parse_report_html(html)
+    for trade in trades:
         trade["notification_date"] = parsed["filing_date"]
         models.insert_trade(conn, filing_id=filing_id, **trade)
 
     models.update_filing_parse_status(
         conn, filing_id, "parsed", parsed_at=datetime.now(timezone.utc).isoformat()
     )
+    issues = sanity_checks.validate_trades(trades)
+    if issues:
+        models.set_reconciliation_note(conn, filing_id, "; ".join(issues))
     return filing_id
 
 
