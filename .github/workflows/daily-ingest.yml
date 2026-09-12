@@ -2,8 +2,12 @@ name: Daily ingest
 
 on:
   schedule:
-    # 11:17 UTC - off-peak minute, avoiding GitHub's top-of-hour scheduling load.
-    - cron: "17 11 * * *"
+    # TEMPORARY - every 15 min, every day, to catch a live filing landing and confirm the
+    # automated pipeline picks it up. Not restricted to weekday business hours (even though
+    # real Senate filed_at data shows that's where 95% of filings happen) since it's
+    # currently a weekend and the goal right now is to observe one soon, not be efficient.
+    # Revert to the daily "17 11 * * *" schedule once verified.
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 permissions:
