@@ -3,8 +3,10 @@
 Safe to run repeatedly (e.g. on a daily schedule) - both scrapers skip anything already
 successfully parsed, so a re-run only fetches genuinely new filings. Each chamber's amendment
 reconciliation runs right after its ingest pass, so newly-arrived amendments never sit
-unreconciled between runs. See PLAN.md for the recommended way to schedule this (Windows Task
-Scheduler) - this script itself has no scheduling logic, it's a single pass.
+unreconciled between runs. Connects to Turso instead of a local file when TURSO_DATABASE_URL
+and TURSO_AUTH_TOKEN are set (see src/db/models.py) - this is how the daily GitHub Actions
+run persists data with no server of its own. This script itself has no scheduling logic,
+it's a single pass.
 
 Usage:
     python -m src.ingest.run_all
@@ -16,9 +18,13 @@ import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from src.db import models
 from src.ingest import house_clerk, senate_efd
 from src.ingest.reconcile_amendments import reconcile_house_amendments, reconcile_senate_amendments
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +112,11 @@ def run_senate(conn, data_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to the SQLite database")
+    parser.add_argument(
+        "--db", default=DEFAULT_DB_PATH,
+        help="Path to the local SQLite database - ignored if TURSO_DATABASE_URL/"
+             "TURSO_AUTH_TOKEN are set in the environment, which connects to Turso instead",
+    )
     parser.add_argument("--data-dir", default="data", help="Directory for raw filing cache and logs")
     parser.add_argument("--house-start-year", type=int, default=DEFAULT_HOUSE_START_YEAR)
     parser.add_argument("--house-end-year", type=int, default=date.today().year)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,12 +11,103 @@ from typing import Optional
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
+class _TursoRow:
+    """Mimics sqlite3.Row (index/name access, .keys()) - libsql returns plain tuples."""
+
+    __slots__ = ("_columns", "_data")
+
+    def __init__(self, columns, data):
+        self._columns = columns
+        self._data = data
+
+    def __getitem__(self, key):
+        return self._data[key] if isinstance(key, int) else self._data[self._columns.index(key)]
+
+    def keys(self):
+        return self._columns
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __repr__(self):
+        return f"TursoRow({dict(zip(self._columns, self._data))!r})"
+
+
+class _TursoCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def _columns(self):
+        return [d[0] for d in self._cursor.description]
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return None if row is None else _TursoRow(self._columns(), row)
+
+    def fetchall(self):
+        columns = self._columns()
+        return [_TursoRow(columns, row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+
+class _TursoConnection:
+    """Wraps a libsql connection with sqlite3.Row-shaped results, and reconnects once on a
+    Hrana "stream not found" error - Turso's remote session can go stale if enough wall-clock
+    time passes between queries (e.g. a scraper busy downloading PDFs), and the connection
+    object doesn't recover from that on its own."""
+
+    def __init__(self, url, token):
+        self._url = url
+        self._token = token
+        self._conn = self._new_conn()
+        self.row_factory = None
+
+    def _new_conn(self):
+        import libsql
+
+        return libsql.connect(database=self._url, auth_token=self._token)
+
+    def _with_reconnect(self, call):
+        try:
+            return call()
+        except ValueError as e:
+            if "stream not found" not in str(e):
+                raise
+            self._conn = self._new_conn()
+            return call()
+
+    def execute(self, sql, params=()):
+        return _TursoCursor(self._with_reconnect(lambda: self._conn.execute(sql, params)))
+
+    def executescript(self, script):
+        return self._with_reconnect(lambda: self._conn.executescript(script))
+
+    def commit(self):
+        return self._conn.commit()
+
+    def close(self):
+        return self._conn.close()
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
-    """Open (creating if needed) the SQLite DB at db_path and ensure the schema exists."""
-    db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    """Open the DB and ensure the schema exists. Connects to Turso when
+    TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are both set in the environment - db_path is
+    ignored in that case. Otherwise opens/creates a local SQLite file at db_path."""
+    turso_url = os.environ.get("TURSO_DATABASE_URL")
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN")
+    if turso_url and turso_token:
+        conn = _TursoConnection(turso_url, turso_token)
+    else:
+        db_path = Path(db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA_PATH.read_text())
     _migrate(conn)

@@ -2,3 +2,5 @@ requests
 beautifulsoup4
 pdfplumber
 pytest
+libsql
+python-dotenv
