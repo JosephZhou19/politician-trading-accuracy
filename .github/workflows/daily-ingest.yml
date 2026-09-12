@@ -2,12 +2,17 @@ name: Daily ingest
 
 on:
   schedule:
-    # TEMPORARY - every 15 min, every day, to catch a live filing landing and confirm the
-    # automated pipeline picks it up. Not restricted to weekday business hours (even though
-    # real Senate filed_at data shows that's where 95% of filings happen) since it's
-    # currently a weekend and the goal right now is to observe one soon, not be efficient.
-    # Revert to the daily "17 11 * * *" schedule once verified.
-    - cron: "*/15 * * * *"
+    # Budgeted at ~1% of Turso's free-tier read quota (~50k rows/run -> ~100 runs/month).
+    # Times aren't evenly spaced - each closes out roughly an equal quarter (weekday) or
+    # half (weekend) of that day-type's real cumulative filing volume (Senate filed_at
+    # data), so no single checkpoint is starved while another covers a near-empty stretch.
+    # ET below is EDT (UTC-4); drifts 1hr during EST (~Nov-Mar) since cron doesn't adjust.
+    - cron: "30 15 * * 1-5"  # ~11:30am ET - closes the morning batch (~25% of weekday volume)
+    - cron: "0 18 * * 1-5"   # ~2:00pm ET  - closes midday (~50%)
+    - cron: "30 20 * * 1-5"  # ~4:30pm ET  - closes early afternoon (~75%)
+    - cron: "0 23 * * 1-5"   # ~7:00pm ET  - closes the evening tail (~97%)
+    - cron: "0 17 * * 0,6"   # ~1:00pm ET  - weekend first half (~50%)
+    - cron: "0 23 * * 0,6"   # ~7:00pm ET  - weekend rest of day
   workflow_dispatch: {}
 
 permissions:
