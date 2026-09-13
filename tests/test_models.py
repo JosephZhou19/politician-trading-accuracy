@@ -566,3 +566,40 @@ def test_delisted_ticker_that_trades_again_reactivates(conn):
     assert tp.price_status == "active"
     assert tp.zero_streak == 0
     assert "AAPL" in models.get_tickers_due_for_price_check(conn)
+
+
+def test_backfill_delisted_status_labels_only_tickers_with_zero_price_history(conn):
+    _insert_priced_trade(conn, "AAPL")
+    _insert_priced_trade(conn, "DEADCO", price_at_transaction=None)
+
+    count = models.backfill_delisted_status(conn)
+
+    assert count == 1
+    assert models.get_ticker_price(conn, "AAPL") is None
+    dead = models.get_ticker_price(conn, "DEADCO")
+    assert dead.price_status == "delisted"
+    assert dead.current_price is None
+    assert dead.last_checked_at is None
+    assert dead.zero_streak == models.ZERO_STREAK_DELIST_THRESHOLD
+
+
+def test_backfill_delisted_status_does_not_touch_or_double_count_existing_rows(conn):
+    _insert_priced_trade(conn, "DEADCO", price_at_transaction=None)
+    models.backfill_delisted_status(conn)
+
+    # A second run must not re-count or overwrite the row it already labeled.
+    second_count = models.backfill_delisted_status(conn)
+
+    assert second_count == 0
+    assert models.get_ticker_price(conn, "DEADCO").price_status == "delisted"
+
+
+def test_backfill_delisted_status_skips_ticker_already_tracked_as_active(conn):
+    """A ticker that has zero price history but is already in ticker_prices for some other
+    reason (e.g. a manual entry) must not be silently relabeled delisted."""
+    _insert_priced_trade(conn, "DEADCO", price_at_transaction=None)
+    models.record_real_price(conn, "DEADCO", 5.0, "2026-01-01T00:00:00Z")
+
+    models.backfill_delisted_status(conn)
+
+    assert models.get_ticker_price(conn, "DEADCO").price_status == "active"

@@ -589,6 +589,45 @@ def get_tickers_due_for_price_check(conn: sqlite3.Connection) -> list[str]:
     return [row["ticker"] for row in rows]
 
 
+def backfill_delisted_status(conn: sqlite3.Connection) -> int:
+    """One-time labeling pass: gives every ticker with zero historical price data anywhere
+    (confirmed dead/acquired/merged via the one-time yfinance backfill, already excluded
+    from get_tickers_due_for_price_check's queue by construction) an explicit
+    price_status='delisted' row, instead of leaving it absent from ticker_prices.
+
+    This doesn't change trickle-job behavior at all - those tickers were already skipped.
+    It's purely so a query against ticker_prices gives a complete, unambiguous answer for
+    every ticker ("confirmed delisted, no price" vs. silence that could as easily mean "not
+    checked yet") for downstream analysis. zero_streak is set to the threshold for internal
+    consistency, though these were never actually queried via Finnhub - the confirmation
+    here comes from a full-history absence in the separate historical backfill, not a live
+    streak, so last_checked_at stays NULL rather than implying a Finnhub check happened.
+    Returns the number of tickers newly labeled."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT t.ticker FROM trades t
+        WHERE t.ticker IS NOT NULL AND t.ticker != ''
+          AND NOT EXISTS (
+              SELECT 1 FROM trades t2 WHERE t2.ticker = t.ticker AND (
+                  t2.price_at_transaction IS NOT NULL OR t2.price_at_notification IS NOT NULL
+                  OR t2.price_30d IS NOT NULL OR t2.price_90d IS NOT NULL
+                  OR t2.price_180d IS NOT NULL OR t2.price_365d IS NOT NULL
+              )
+          )
+          AND t.ticker NOT IN (SELECT ticker FROM ticker_prices)
+        """
+    ).fetchall()
+    tickers = [row["ticker"] for row in rows]
+    for ticker in tickers:
+        conn.execute(
+            """INSERT INTO ticker_prices (ticker, current_price, price_updated_at, price_status, zero_streak, last_checked_at)
+               VALUES (?, NULL, NULL, 'delisted', ?, NULL)""",
+            (ticker, ZERO_STREAK_DELIST_THRESHOLD),
+        )
+    conn.commit()
+    return len(tickers)
+
+
 def start_ingestion_run(conn: sqlite3.Connection, chamber: str, started_at: str) -> int:
     cur = conn.execute(
         "INSERT INTO ingestion_runs (chamber, started_at, status) VALUES (?, ?, 'running')",
