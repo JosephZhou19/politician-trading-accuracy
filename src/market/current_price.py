@@ -8,10 +8,13 @@ BRK-B both return the same quote) - no normalization needed here.
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://finnhub.io/api/v1/quote"
 
@@ -37,7 +40,19 @@ def fetch_current_price(ticker: str, api_key: str | None = None) -> float | None
 
 def fetch_current_prices(tickers, api_key: str | None = None):
     """Yields (ticker, price_or_None) for each ticker, paced to stay under Finnhub's rate
-    limit across a long, multi-thousand-ticker run."""
+    limit across a long, multi-thousand-ticker run.
+
+    A ticker whose request itself fails (network error, rate limit, bad response) is
+    skipped rather than yielded - it must never be treated the same as a real c=0 "no data"
+    response, since that's exactly what feeds the zero_streak delisting counter. It's just
+    retried on the next run instead."""
     for ticker in tickers:
-        yield ticker, fetch_current_price(ticker, api_key=api_key)
-        time.sleep(MIN_SECONDS_BETWEEN_CALLS)
+        try:
+            try:
+                price = fetch_current_price(ticker, api_key=api_key)
+            except requests.RequestException as e:
+                logger.warning("Skipping %s this run - Finnhub request failed: %r", ticker, e)
+                continue
+            yield ticker, price
+        finally:
+            time.sleep(MIN_SECONDS_BETWEEN_CALLS)
