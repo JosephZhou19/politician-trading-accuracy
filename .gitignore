@@ -17,6 +17,15 @@ nancy_pelosi.txt
 josh_gottheimer.txt
 marjorie_taylor_greene.txt
 
+# One-off delisted-ticker research (Wikipedia classification) and its outputs - not
+# part of the shipped pipeline, regeneratable from source
+scratch_classify_delistings.py
+classify_delistings*.log
+ticker_names*.json
+delisting_classification.json
+failed_tickers.txt
+dead_tickers.csv
+
 # Python
 __pycache__/
 *.py[cod]

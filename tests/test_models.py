@@ -1,4 +1,6 @@
+import datetime
 import sqlite3
+from unittest.mock import patch
 
 import pytest
 
@@ -399,3 +401,168 @@ def test_ingestion_run_round_trip(conn):
     assert row["filings_new"] == 8
     assert row["filings_failed"] == 1
     assert row["finished_at"] == "2026-09-05T01:00:00"
+
+
+def _make_turso_connection():
+    """A _TursoConnection with a fake underlying libsql connection, so the reconnect
+    behavior can be tested without a real Turso database."""
+    with patch.object(models._TursoConnection, "_new_conn", return_value="fresh-conn"):
+        return models._TursoConnection("libsql://fake", "fake-token")
+
+
+def test_turso_reconnects_once_on_stale_stream():
+    conn = _make_turso_connection()
+    call_count = {"n": 0}
+
+    def flaky():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ValueError("stream not found")
+        return "ok"
+
+    with patch.object(conn, "_new_conn", return_value="reconnected-conn") as mock_new_conn, \
+            patch.object(models, "logger") as mock_logger:
+        result = conn._with_reconnect(flaky)
+
+    assert result == "ok"
+    assert call_count["n"] == 2
+    mock_new_conn.assert_called_once()
+    assert conn._conn == "reconnected-conn"
+    mock_logger.warning.assert_called_once()
+    assert "reconnecting" in mock_logger.warning.call_args[0][0]
+
+
+def test_turso_reraises_non_stream_errors():
+    conn = _make_turso_connection()
+
+    def always_fails():
+        raise ValueError("some other database error")
+
+    with pytest.raises(ValueError, match="some other database error"):
+        conn._with_reconnect(always_fails)
+
+
+def test_turso_logs_slow_call():
+    conn = _make_turso_connection()
+    with patch("src.db.models.time.monotonic", side_effect=[0.0, 0.6]), \
+            patch.object(models, "logger") as mock_logger:
+        result = conn._with_reconnect(lambda: "ok")
+
+    assert result == "ok"
+    mock_logger.warning.assert_called_once()
+    assert "Slow Turso call" in mock_logger.warning.call_args[0][0]
+
+
+def test_turso_does_not_log_fast_call():
+    conn = _make_turso_connection()
+    with patch("src.db.models.time.monotonic", side_effect=[0.0, 0.1]), \
+            patch.object(models, "logger") as mock_logger:
+        result = conn._with_reconnect(lambda: "ok")
+
+    assert result == "ok"
+    mock_logger.warning.assert_not_called()
+
+
+def _insert_priced_trade(conn, ticker, *, source_row_number=1, price_at_transaction=100.0):
+    """A trade with real historical price data - the kind that puts its ticker in the
+    price-trickle job's work queue."""
+    filing_id = _insert_test_filing(conn, external_filing_id=f"filing-{ticker}-{source_row_number}")
+    trade_id = models.insert_trade(
+        conn,
+        filing_id=filing_id,
+        source_row_number=source_row_number,
+        ticker=ticker,
+        asset_name=f"{ticker} Inc.",
+        asset_type="Stock",
+        transaction_type="purchase",
+        transaction_date="2026-01-05",
+        notification_date="2026-01-20",
+        amount_low=1001,
+        owner="self",
+    )
+    if price_at_transaction is not None:
+        models.set_trade_prices(conn, trade_id, {"price_at_transaction": price_at_transaction})
+    return trade_id
+
+
+def test_ticker_with_no_price_data_is_excluded_from_price_check_universe(conn):
+    _insert_priced_trade(conn, "AAPL")
+    _insert_priced_trade(conn, "DEADCO", price_at_transaction=None)  # never priced - known-dead
+
+    due = models.get_tickers_due_for_price_check(conn)
+
+    assert "AAPL" in due
+    assert "DEADCO" not in due
+
+
+def test_new_ticker_is_due_for_a_check(conn):
+    _insert_priced_trade(conn, "AAPL")
+    assert "AAPL" in models.get_tickers_due_for_price_check(conn)
+
+
+def test_record_real_price_then_zero_response_does_not_erase_it(conn):
+    _insert_priced_trade(conn, "AAPL")
+    models.record_real_price(conn, "AAPL", 200.50, "2026-01-01T00:00:00Z")
+    models.record_zero_response(conn, "AAPL", "2026-01-02T00:00:00Z")
+
+    tp = models.get_ticker_price(conn, "AAPL")
+    assert tp.current_price == 200.50  # frozen, not overwritten by the zero
+    assert tp.price_status == "active"
+    assert tp.zero_streak == 1
+
+
+def test_zero_streak_flips_to_delisted_at_threshold(conn):
+    _insert_priced_trade(conn, "AAPL")
+    for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD - 1):
+        models.record_zero_response(conn, "AAPL", "2026-01-01T00:00:00Z")
+    assert models.get_ticker_price(conn, "AAPL").price_status == "active"
+
+    models.record_zero_response(conn, "AAPL", "2026-01-15T00:00:00Z")
+
+    tp = models.get_ticker_price(conn, "AAPL")
+    assert tp.price_status == "delisted"
+    assert tp.zero_streak == models.ZERO_STREAK_DELIST_THRESHOLD
+
+
+def test_real_price_resets_zero_streak(conn):
+    _insert_priced_trade(conn, "AAPL")
+    models.record_zero_response(conn, "AAPL", "2026-01-01T00:00:00Z")
+    models.record_zero_response(conn, "AAPL", "2026-01-02T00:00:00Z")
+    models.record_real_price(conn, "AAPL", 150.0, "2026-01-03T00:00:00Z")
+
+    tp = models.get_ticker_price(conn, "AAPL")
+    assert tp.zero_streak == 0
+    assert tp.price_status == "active"
+    assert tp.current_price == 150.0
+
+
+def test_delisted_ticker_is_excluded_until_recheck_window(conn):
+    just_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    _insert_priced_trade(conn, "AAPL")
+    for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD):
+        models.record_zero_response(conn, "AAPL", just_now)
+    assert models.get_ticker_price(conn, "AAPL").price_status == "delisted"
+
+    # Just flagged - not due again immediately.
+    assert "AAPL" not in models.get_tickers_due_for_price_check(conn)
+
+    # But a delisted ticker checked too long ago is due again (the monthly safety net).
+    conn.execute(
+        "UPDATE ticker_prices SET last_checked_at = ? WHERE ticker = ?",
+        ("2020-01-01T00:00:00Z", "AAPL"),
+    )
+    conn.commit()
+    assert "AAPL" in models.get_tickers_due_for_price_check(conn)
+
+
+def test_delisted_ticker_that_trades_again_reactivates(conn):
+    _insert_priced_trade(conn, "AAPL")
+    for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD):
+        models.record_zero_response(conn, "AAPL", "2026-01-01T00:00:00Z")
+
+    models.record_real_price(conn, "AAPL", 42.0, "2026-02-01T00:00:00Z")
+
+    tp = models.get_ticker_price(conn, "AAPL")
+    assert tp.price_status == "active"
+    assert tp.zero_streak == 0
+    assert "AAPL" in models.get_tickers_due_for_price_check(conn)

@@ -84,12 +84,38 @@ CREATE TABLE IF NOT EXISTS trades (
     filing_status           TEXT,
     superseded_by_trade_id  INTEGER REFERENCES trades (id),
     reconciliation_note     TEXT,
+    -- Fixed facts about this specific trade (all via yfinance's split/dividend-adjusted
+    -- Open price, on the given date or the next trading day) - never change once set, so
+    -- they live directly on the trade rather than in a lookup table. NULL for trades with
+    -- no ticker, and for anything not yet backfilled or not yet reached (a horizon date
+    -- that hasn't happened yet stays NULL until the daily catch-up job's date arrives).
+    -- Current/ongoing price is a property of the ticker, not the trade - see ticker_prices.
+    price_at_transaction    REAL,
+    price_at_notification   REAL,
+    price_30d               REAL,
+    price_90d               REAL,
+    price_180d              REAL,
+    price_365d              REAL,
     UNIQUE (filing_id, source_row_number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_filing_id ON trades (filing_id);
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades (ticker);
 CREATE INDEX IF NOT EXISTS idx_trades_transaction_date ON trades (transaction_date);
+
+-- One row per distinct ticker - current price is a shared, mutable fact about the stock,
+-- not the trade, so it's stored once here and joined against every trade of that ticker
+-- rather than repeated per-trade. Refreshed by the daily Finnhub trickle job.
+-- current_price/price_updated_at are nullable: a ticker can accumulate zero_streak before
+-- ever getting a real price (e.g. it delists the same day the trickle job first sees it).
+CREATE TABLE IF NOT EXISTS ticker_prices (
+    ticker            TEXT PRIMARY KEY,
+    current_price     REAL,
+    price_updated_at  TEXT,
+    price_status      TEXT NOT NULL DEFAULT 'active' CHECK (price_status IN ('active', 'delisted')),
+    zero_streak       INTEGER NOT NULL DEFAULT 0,
+    last_checked_at   TEXT
+);
 
 -- One row per scraper invocation, for observability once ingestion runs on a schedule.
 CREATE TABLE IF NOT EXISTS ingestion_runs (

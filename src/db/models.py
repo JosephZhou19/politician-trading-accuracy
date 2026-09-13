@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
@@ -74,13 +78,22 @@ class _TursoConnection:
         return libsql.connect(database=self._url, auth_token=self._token)
 
     def _with_reconnect(self, call):
+        start = time.monotonic()
         try:
-            return call()
+            result = call()
         except ValueError as e:
             if "stream not found" not in str(e):
                 raise
+            logger.warning(
+                "Turso stream went stale after %.0fms - reconnecting and retrying",
+                (time.monotonic() - start) * 1000,
+            )
             self._conn = self._new_conn()
-            return call()
+            result = call()
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if elapsed_ms > 500:
+            logger.warning("Slow Turso call: %.0fms", elapsed_ms)
+        return result
 
     def execute(self, sql, params=()):
         return _TursoCursor(self._with_reconnect(lambda: self._conn.execute(sql, params)))
@@ -114,17 +127,51 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+_TRADES_ADDITIVE_COLUMNS = [
+    ("filing_status", "TEXT"),
+    ("superseded_by_trade_id", "INTEGER REFERENCES trades(id)"),
+    ("reconciliation_note", "TEXT"),
+    ("price_at_transaction", "REAL"),
+    ("price_at_notification", "REAL"),
+    ("price_30d", "REAL"),
+    ("price_90d", "REAL"),
+    ("price_180d", "REAL"),
+    ("price_365d", "REAL"),
+]
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Additive columns added after a DB already existed - CREATE TABLE IF NOT EXISTS in
     schema.sql only creates missing tables, it doesn't retrofit columns onto one that's
     already there."""
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
-    if "filing_status" not in existing:
-        conn.execute("ALTER TABLE trades ADD COLUMN filing_status TEXT")
-    if "superseded_by_trade_id" not in existing:
-        conn.execute("ALTER TABLE trades ADD COLUMN superseded_by_trade_id INTEGER REFERENCES trades(id)")
-    if "reconciliation_note" not in existing:
-        conn.execute("ALTER TABLE trades ADD COLUMN reconciliation_note TEXT")
+    for name, coltype in _TRADES_ADDITIVE_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {coltype}")
+    conn.commit()
+    _migrate_ticker_prices(conn)
+
+
+def _migrate_ticker_prices(conn: sqlite3.Connection) -> None:
+    """ticker_prices originally had NOT NULL current_price/price_updated_at, before the
+    price-trickle job's zero_streak tracking needed to represent "no real price seen yet."
+    SQLite can't drop a NOT NULL constraint via ALTER, so this drops and recreates the table -
+    safe because it was created but never populated (no trickle job existed yet to write to
+    it) as of this migration."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(ticker_prices)")}
+    if not existing or "price_status" in existing:
+        return
+    conn.execute("DROP TABLE ticker_prices")
+    conn.executescript(
+        """CREATE TABLE ticker_prices (
+               ticker            TEXT PRIMARY KEY,
+               current_price     REAL,
+               price_updated_at  TEXT,
+               price_status      TEXT NOT NULL DEFAULT 'active' CHECK (price_status IN ('active', 'delisted')),
+               zero_streak       INTEGER NOT NULL DEFAULT 0,
+               last_checked_at   TEXT
+           );"""
+    )
     conn.commit()
 
 
@@ -161,6 +208,16 @@ class Filing:
 
 
 @dataclass
+class TickerPrice:
+    ticker: str
+    current_price: Optional[float]
+    price_updated_at: Optional[str]
+    price_status: str
+    zero_streak: int
+    last_checked_at: Optional[str]
+
+
+@dataclass
 class Trade:
     id: int
     filing_id: int
@@ -179,6 +236,12 @@ class Trade:
     filing_status: Optional[str]
     superseded_by_trade_id: Optional[int]
     reconciliation_note: Optional[str]
+    price_at_transaction: Optional[float]
+    price_at_notification: Optional[float]
+    price_30d: Optional[float]
+    price_90d: Optional[float]
+    price_180d: Optional[float]
+    price_365d: Optional[float]
 
 
 def _row_to_filing(row: sqlite3.Row) -> Filing:
@@ -380,9 +443,56 @@ def set_trade_superseded(conn: sqlite3.Connection, trade_id: int, superseded_by_
     conn.commit()
 
 
-def set_trade_reconciliation_note(conn: sqlite3.Connection, trade_id: int, note: str) -> None:
+def set_trade_reconciliation_note(conn: sqlite3.Connection, trade_id: int, note: str, *, commit: bool = True) -> None:
     conn.execute("UPDATE trades SET reconciliation_note = ? WHERE id = ?", (note, trade_id))
-    conn.commit()
+    if commit:
+        conn.commit()
+
+
+PRICE_COLUMNS = (
+    "price_at_transaction", "price_at_notification",
+    "price_30d", "price_90d", "price_180d", "price_365d",
+)
+# Trading-day offset from transaction_date for each horizon column, in the order a trade's
+# journey through them actually happens - used by the daily catch-up job to know which date
+# to test each column against.
+HORIZON_COLUMNS = (("price_30d", 30), ("price_90d", 90), ("price_180d", 180), ("price_365d", 365))
+
+
+def set_trade_prices(conn: sqlite3.Connection, trade_id: int, prices: dict, *, commit: bool = True) -> None:
+    """Sets one or more price columns on a trade in a single UPDATE - a ticker with
+    thousands of trades (e.g. MSFT) would otherwise mean up to 6 separate network
+    round-trips per trade against Turso just to set that trade's own prices. commit=False
+    lets a caller batch many trades' worth of writes into one commit (e.g. per ticker group)
+    instead of one round-trip per trade."""
+    bad = set(prices) - set(PRICE_COLUMNS)
+    if bad:
+        raise ValueError(f"not price column(s): {bad}")
+    if not prices:
+        return
+    assignments = ", ".join(f"{col} = ?" for col in prices)
+    conn.execute(f"UPDATE trades SET {assignments} WHERE id = ?", (*prices.values(), trade_id))
+    if commit:
+        conn.commit()
+
+
+def get_trades_needing_prices(conn: sqlite3.Connection) -> list[Trade]:
+    """Ticker'd trades with at least one currently-fetchable price still unset: transaction/
+    notification price (always fetchable - both dates are already in the past by the time a
+    trade exists at all), or a 30/90/180/365-day horizon whose date has now arrived. This is
+    the shared work queue for both the one-time historical backfill and the daily catch-up
+    job - the same trade can reappear here across several days as later horizons arrive."""
+    horizon_conditions = " OR ".join(
+        f"({col} IS NULL AND date(transaction_date, '+{days} days') <= date('now'))"
+        for col, days in HORIZON_COLUMNS
+    )
+    rows = conn.execute(
+        f"""SELECT * FROM trades WHERE ticker IS NOT NULL AND ticker != '' AND (
+                price_at_transaction IS NULL OR price_at_notification IS NULL
+                OR {horizon_conditions}
+            )"""
+    ).fetchall()
+    return [_row_to_trade(row) for row in rows]
 
 
 def get_trades_for_filing(conn: sqlite3.Connection, filing_id: int) -> list[Trade]:
@@ -397,6 +507,86 @@ def delete_trades_for_filing(conn: sqlite3.Connection, filing_id: int) -> None:
     row, so its old trades need clearing first)."""
     conn.execute("DELETE FROM trades WHERE filing_id = ?", (filing_id,))
     conn.commit()
+
+
+# Consecutive daily zero-responses from Finnhub required before concluding a ticker is
+# actually delisted, not just mid trading-halt - anchored to SEC Rule 12(k), which caps an
+# ordinary trading suspension at 10 business days, plus a margin.
+ZERO_STREAK_DELIST_THRESHOLD = 15
+# Once flagged delisted, how rarely to keep checking as a self-healing safety net (in case
+# the classification above was ever wrong) rather than stopping forever.
+DELISTED_RECHECK_DAYS = 30
+
+
+def get_ticker_price(conn: sqlite3.Connection, ticker: str) -> Optional[TickerPrice]:
+    row = conn.execute("SELECT * FROM ticker_prices WHERE ticker = ?", (ticker,)).fetchone()
+    return TickerPrice(**{k: row[k] for k in row.keys()}) if row else None
+
+
+def record_real_price(conn: sqlite3.Connection, ticker: str, price: float, checked_at: str) -> None:
+    """A real Finnhub quote came back - always wins over any prior zero-streak, whether
+    this is the ticker's first-ever price or a 'delisted' ticker unexpectedly trading again
+    during its monthly safety-net check."""
+    conn.execute(
+        """INSERT INTO ticker_prices (ticker, current_price, price_updated_at, price_status, zero_streak, last_checked_at)
+           VALUES (?, ?, ?, 'active', 0, ?)
+           ON CONFLICT (ticker) DO UPDATE SET
+               current_price = excluded.current_price,
+               price_updated_at = excluded.price_updated_at,
+               price_status = 'active',
+               zero_streak = 0,
+               last_checked_at = excluded.last_checked_at""",
+        (ticker, price, checked_at, checked_at),
+    )
+    conn.commit()
+
+
+def record_zero_response(conn: sqlite3.Connection, ticker: str, checked_at: str) -> None:
+    """Finnhub returned c == 0 (no data) - never overwrites current_price, which stays
+    frozen at its last real value (or NULL, if this ticker has never had one). Increments
+    the streak in one statement (no read-then-write race) and flips to 'delisted' once the
+    streak crosses ZERO_STREAK_DELIST_THRESHOLD."""
+    conn.execute(
+        """INSERT INTO ticker_prices (ticker, price_status, zero_streak, last_checked_at)
+           VALUES (?, 'active', 1, ?)
+           ON CONFLICT (ticker) DO UPDATE SET
+               zero_streak = ticker_prices.zero_streak + 1,
+               price_status = CASE WHEN ticker_prices.zero_streak + 1 >= ?
+                                    THEN 'delisted' ELSE ticker_prices.price_status END,
+               last_checked_at = excluded.last_checked_at""",
+        (ticker, checked_at, ZERO_STREAK_DELIST_THRESHOLD),
+    )
+    conn.commit()
+
+
+def get_tickers_due_for_price_check(conn: sqlite3.Connection) -> list[str]:
+    """The daily trickle job's work queue: every ticker that has at least one real
+    historical price already on some trade (a ticker with zero price data anywhere is
+    already known-dead from the one-time backfill - Finnhub returning c=0 for it would be
+    known information, not worth spending quota to reconfirm), joined against ticker_prices
+    to skip 'delisted' tickers except on their once-a-month safety-net recheck."""
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT t.ticker FROM trades t
+        LEFT JOIN ticker_prices tp ON tp.ticker = t.ticker
+        WHERE t.ticker IS NOT NULL AND t.ticker != ''
+          AND EXISTS (
+              SELECT 1 FROM trades t2 WHERE t2.ticker = t.ticker AND (
+                  t2.price_at_transaction IS NOT NULL OR t2.price_at_notification IS NOT NULL
+                  OR t2.price_30d IS NOT NULL OR t2.price_90d IS NOT NULL
+                  OR t2.price_180d IS NOT NULL OR t2.price_365d IS NOT NULL
+              )
+          )
+          AND (
+              tp.ticker IS NULL
+              OR tp.price_status = 'active'
+              OR (tp.price_status = 'delisted'
+                  AND (tp.last_checked_at IS NULL
+                       OR julianday('now') - julianday(tp.last_checked_at) >= {DELISTED_RECHECK_DAYS}))
+          )
+        """
+    ).fetchall()
+    return [row["ticker"] for row in rows]
 
 
 def start_ingestion_run(conn: sqlite3.Connection, chamber: str, started_at: str) -> int:

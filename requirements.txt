@@ -4,3 +4,4 @@ pdfplumber
 pytest
 libsql
 python-dotenv
+yfinance

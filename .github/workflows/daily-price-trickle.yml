@@ -1,0 +1,37 @@
+name: Daily price trickle
+
+on:
+  schedule:
+    # ~5:30pm ET, weekdays only - after the 4:00pm ET market close, with a half-hour buffer
+    # for Finnhub's own quote data to settle. ET below is EDT (UTC-4); drifts 1hr during EST
+    # (~Nov-Mar) since cron doesn't adjust - fine here, this job isn't time-sensitive within
+    # an hour. No weekend runs: US markets are closed, so a weekend check would just spend
+    # quota re-confirming Friday's close.
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-price-trickle
+  cancel-in-progress: false
+
+jobs:
+  update-prices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - run: python -m scripts.update_current_prices
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
