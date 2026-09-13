@@ -1,10 +1,6 @@
 """One-time backfill: labels every ticker with zero historical price data anywhere
 (confirmed dead/acquired/merged - see PLAN.md) as price_status='delisted' in ticker_prices.
-
-Doesn't change the daily trickle job's behavior - those tickers were already excluded from
-its queue by construction. This is purely so a query against ticker_prices gives a
-complete, unambiguous answer for every ticker instead of silence for the ones never
-checked. See models.backfill_delisted_status for the exact logic.
+See models.backfill_delisted_status for why.
 
 Usage:
     python -m scripts.backfill_delisted_status --db data/congress_trades.db

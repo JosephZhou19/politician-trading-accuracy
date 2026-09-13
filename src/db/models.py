@@ -591,18 +591,12 @@ def get_tickers_due_for_price_check(conn: sqlite3.Connection) -> list[str]:
 
 def backfill_delisted_status(conn: sqlite3.Connection) -> int:
     """One-time labeling pass: gives every ticker with zero historical price data anywhere
-    (confirmed dead/acquired/merged via the one-time yfinance backfill, already excluded
-    from get_tickers_due_for_price_check's queue by construction) an explicit
-    price_status='delisted' row, instead of leaving it absent from ticker_prices.
-
-    This doesn't change trickle-job behavior at all - those tickers were already skipped.
-    It's purely so a query against ticker_prices gives a complete, unambiguous answer for
-    every ticker ("confirmed delisted, no price" vs. silence that could as easily mean "not
-    checked yet") for downstream analysis. zero_streak is set to the threshold for internal
-    consistency, though these were never actually queried via Finnhub - the confirmation
-    here comes from a full-history absence in the separate historical backfill, not a live
-    streak, so last_checked_at stays NULL rather than implying a Finnhub check happened.
-    Returns the number of tickers newly labeled."""
+    (already excluded from get_tickers_due_for_price_check's queue by construction) an
+    explicit price_status='delisted' row instead of leaving it absent from ticker_prices -
+    absence reads as ambiguous ("confirmed dead" vs. "not checked yet") for downstream
+    analysis. zero_streak is set to the threshold for consistency, but last_checked_at
+    stays NULL since no Finnhub call happened - this comes from the historical backfill's
+    absence of data, a different source. Returns the count newly labeled."""
     rows = conn.execute(
         """
         SELECT DISTINCT t.ticker FROM trades t
