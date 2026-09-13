@@ -117,6 +117,15 @@ CREATE TABLE IF NOT EXISTS ticker_prices (
     last_checked_at   TEXT
 );
 
+-- Single-row bookmark for the trickle job: the last ticker it successfully checked, so a
+-- run that hits its time budget before finishing the whole universe resumes right after
+-- this ticker next time instead of restarting from the top (and risking never reaching the
+-- tickers alphabetically near the end).
+CREATE TABLE IF NOT EXISTS trickle_cursor (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    last_ticker TEXT
+);
+
 -- One row per scraper invocation, for observability once ingestion runs on a schedule.
 CREATE TABLE IF NOT EXISTS ingestion_runs (
     id              INTEGER PRIMARY KEY,

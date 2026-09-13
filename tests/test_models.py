@@ -603,3 +603,33 @@ def test_backfill_delisted_status_skips_ticker_already_tracked_as_active(conn):
     models.backfill_delisted_status(conn)
 
     assert models.get_ticker_price(conn, "DEADCO").price_status == "active"
+
+
+def test_trickle_cursor_round_trip(conn):
+    assert models.get_trickle_cursor(conn) is None
+    models.set_trickle_cursor(conn, "AAPL")
+    assert models.get_trickle_cursor(conn) == "AAPL"
+    models.set_trickle_cursor(conn, "MSFT")
+    assert models.get_trickle_cursor(conn) == "MSFT"
+
+
+def test_trickle_cursor_can_be_cleared(conn):
+    models.set_trickle_cursor(conn, "AAPL")
+    models.set_trickle_cursor(conn, None)
+    assert models.get_trickle_cursor(conn) is None
+
+
+def test_tickers_due_for_price_check_are_ordered(conn):
+    _insert_priced_trade(conn, "MSFT")
+    _insert_priced_trade(conn, "AAPL", source_row_number=2)
+    _insert_priced_trade(conn, "GOOG", source_row_number=3)
+
+    assert models.get_tickers_due_for_price_check(conn) == ["AAPL", "GOOG", "MSFT"]
+
+
+def test_record_functions_can_defer_commit(conn):
+    _insert_priced_trade(conn, "AAPL")
+    models.record_real_price(conn, "AAPL", 100.0, "2026-01-01T00:00:00Z", commit=False)
+    # Uncommitted writes are still visible on the same connection (no separate reader here),
+    # so this mainly confirms the call succeeds without raising when commit=False.
+    assert models.get_ticker_price(conn, "AAPL").current_price == 100.0

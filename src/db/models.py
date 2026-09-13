@@ -523,10 +523,11 @@ def get_ticker_price(conn: sqlite3.Connection, ticker: str) -> Optional[TickerPr
     return TickerPrice(**{k: row[k] for k in row.keys()}) if row else None
 
 
-def record_real_price(conn: sqlite3.Connection, ticker: str, price: float, checked_at: str) -> None:
+def record_real_price(conn: sqlite3.Connection, ticker: str, price: float, checked_at: str, *, commit: bool = True) -> None:
     """A real Finnhub quote came back - always wins over any prior zero-streak, whether
     this is the ticker's first-ever price or a 'delisted' ticker unexpectedly trading again
-    during its monthly safety-net check."""
+    during its monthly safety-net check. commit=False lets a caller batch many tickers'
+    writes into one round-trip instead of one per ticker."""
     conn.execute(
         """INSERT INTO ticker_prices (ticker, current_price, price_updated_at, price_status, zero_streak, last_checked_at)
            VALUES (?, ?, ?, 'active', 0, ?)
@@ -538,14 +539,15 @@ def record_real_price(conn: sqlite3.Connection, ticker: str, price: float, check
                last_checked_at = excluded.last_checked_at""",
         (ticker, price, checked_at, checked_at),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def record_zero_response(conn: sqlite3.Connection, ticker: str, checked_at: str) -> None:
+def record_zero_response(conn: sqlite3.Connection, ticker: str, checked_at: str, *, commit: bool = True) -> None:
     """Finnhub returned c == 0 (no data) - never overwrites current_price, which stays
     frozen at its last real value (or NULL, if this ticker has never had one). Increments
     the streak in one statement (no read-then-write race) and flips to 'delisted' once the
-    streak crosses ZERO_STREAK_DELIST_THRESHOLD."""
+    streak crosses ZERO_STREAK_DELIST_THRESHOLD. commit=False batches like record_real_price."""
     conn.execute(
         """INSERT INTO ticker_prices (ticker, price_status, zero_streak, last_checked_at)
            VALUES (?, 'active', 1, ?)
@@ -556,7 +558,8 @@ def record_zero_response(conn: sqlite3.Connection, ticker: str, checked_at: str)
                last_checked_at = excluded.last_checked_at""",
         (ticker, checked_at, ZERO_STREAK_DELIST_THRESHOLD),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def get_tickers_due_for_price_check(conn: sqlite3.Connection) -> list[str]:
@@ -564,7 +567,9 @@ def get_tickers_due_for_price_check(conn: sqlite3.Connection) -> list[str]:
     historical price already on some trade (a ticker with zero price data anywhere is
     already known-dead from the one-time backfill - Finnhub returning c=0 for it would be
     known information, not worth spending quota to reconfirm), joined against ticker_prices
-    to skip 'delisted' tickers except on their once-a-month safety-net recheck."""
+    to skip 'delisted' tickers except on their once-a-month safety-net recheck. Ordered by
+    ticker so the trickle job's resume cursor (a bookmark by ticker value) is deterministic
+    across runs even as the underlying set of due tickers shifts."""
     rows = conn.execute(
         f"""
         SELECT DISTINCT t.ticker FROM trades t
@@ -584,9 +589,24 @@ def get_tickers_due_for_price_check(conn: sqlite3.Connection) -> list[str]:
                   AND (tp.last_checked_at IS NULL
                        OR julianday('now') - julianday(tp.last_checked_at) >= {DELISTED_RECHECK_DAYS}))
           )
+        ORDER BY t.ticker
         """
     ).fetchall()
     return [row["ticker"] for row in rows]
+
+
+def get_trickle_cursor(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute("SELECT last_ticker FROM trickle_cursor WHERE id = 1").fetchone()
+    return row["last_ticker"] if row else None
+
+
+def set_trickle_cursor(conn: sqlite3.Connection, last_ticker: Optional[str]) -> None:
+    conn.execute(
+        """INSERT INTO trickle_cursor (id, last_ticker) VALUES (1, ?)
+           ON CONFLICT (id) DO UPDATE SET last_ticker = excluded.last_ticker""",
+        (last_ticker,),
+    )
+    conn.commit()
 
 
 def backfill_delisted_status(conn: sqlite3.Connection) -> int:

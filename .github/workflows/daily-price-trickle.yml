@@ -20,7 +20,10 @@ concurrency:
 jobs:
   update-prices:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The job itself self-limits to a 75-minute budget and saves a resume cursor before
+    # stopping (see scripts/update_current_prices.py) - this timeout is a backstop well
+    # beyond that, not the primary defense against a slow run.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
 
