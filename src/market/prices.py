@@ -60,6 +60,15 @@ class TickerHistory:
             idx += 1
         return None
 
+    def daily_prices(self) -> list[tuple[datetime.date, float]]:
+        """Every (date, price) pair with a real Open - for bulk-loading a lookup table
+        (e.g. benchmark_prices) rather than the point-lookup use price_on_or_after serves."""
+        return [
+            (date, float(price))
+            for date, price in self._opens.items()
+            if not math.isnan(price)
+        ]
+
 
 def fetch_ticker_history(
     ticker: str, start_date: datetime.date, end_date: datetime.date

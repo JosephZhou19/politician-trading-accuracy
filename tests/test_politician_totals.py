@@ -8,7 +8,7 @@ _leg_counter = {"n": 0}
 
 def _insert_trade(conn, legislator, ticker, *, transaction_type="purchase",
                    amount_low=1000, amount_high=1000, price_at_transaction=100.0,
-                   asset_type="Stock", transaction_date="2026-01-05"):
+                   price_365d=None, asset_type="Stock", transaction_date="2026-01-05"):
     first, last = legislator
     leg_id = models.get_or_create_legislator(conn, first, last, "senate", "member")
     _leg_counter["n"] += 1
@@ -26,8 +26,13 @@ def _insert_trade(conn, legislator, ticker, *, transaction_type="purchase",
         notification_date=transaction_date, amount_low=amount_low, amount_high=amount_high,
         owner="self",
     )
+    prices = {}
     if price_at_transaction is not None:
-        models.set_trade_prices(conn, trade_id, {"price_at_transaction": price_at_transaction})
+        prices["price_at_transaction"] = price_at_transaction
+    if price_365d is not None:
+        prices["price_365d"] = price_365d
+    if prices:
+        models.set_trade_prices(conn, trade_id, prices)
     return leg_id, trade_id
 
 
@@ -183,3 +188,23 @@ def test_delisted_ticker_excluded_from_stock_totals_same_as_position_view(conn):
     assert row["distinct_tickers_held"] == position_count
     assert row["total_stock_buy_count"] == 1
     assert row["total_trades_all_types"] == 2  # but still counted here - "all types" is literal
+
+
+def test_all_time_alpha_matches_yearly_view(conn):
+    leg_id, _ = _insert_trade(conn, ("Alan", "Armstrong"), "AAPL", transaction_date="2020-01-02",
+                              price_at_transaction=100.0, price_365d=150.0)  # +50%
+    models.set_benchmark_prices(conn, [("2020-01-02", 100.0), ("2021-01-02", 110.0)])  # spy +10%
+
+    row = _totals(conn, leg_id)
+    assert row["trades_with_alpha_data"] == 1
+    assert abs(row["avg_1yr_alpha_pct"] - 40.0) < 1e-9  # (+50%) - (+10%)
+
+
+def test_all_time_alpha_null_without_benchmark_data(conn):
+    leg_id, _ = _insert_trade(conn, ("Alan", "Armstrong"), "AAPL", transaction_date="2020-01-02",
+                              price_at_transaction=100.0, price_365d=150.0)
+    # No benchmark_prices rows loaded at all.
+
+    row = _totals(conn, leg_id)
+    assert row["trades_with_alpha_data"] == 0
+    assert row["avg_1yr_alpha_pct"] is None

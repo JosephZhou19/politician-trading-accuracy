@@ -34,6 +34,16 @@ def test_price_beyond_available_history_returns_none():
     assert h.price_on_or_after(datetime.date(2024, 6, 1)) is None
 
 
+def test_daily_prices_returns_every_real_point():
+    h = _history([((2024, 1, 2), 100.0), ((2024, 1, 3), 101.0)])
+    assert h.daily_prices() == [(datetime.date(2024, 1, 2), 100.0), (datetime.date(2024, 1, 3), 101.0)]
+
+
+def test_daily_prices_skips_nan():
+    h = _history([((2024, 1, 2), 100.0), ((2024, 1, 3), math.nan)])
+    assert h.daily_prices() == [(datetime.date(2024, 1, 2), 100.0)]
+
+
 def test_price_does_not_roll_forward_across_a_recycled_ticker_gap():
     """Regression: MON (Monsanto, delisted 2018) was recycled by an unrelated company
     trading under the same symbol from 2021 - querying MON for a real 2014 Monsanto trade

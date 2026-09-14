@@ -609,6 +609,28 @@ def set_trickle_cursor(conn: sqlite3.Connection, last_ticker: Optional[str]) -> 
     conn.commit()
 
 
+def get_earliest_stock_trade_date(conn: sqlite3.Connection) -> Optional[str]:
+    """Earliest transaction_date needing a benchmark price - drives how far back the
+    one-time SPY backfill needs to fetch."""
+    row = conn.execute(
+        """SELECT MIN(transaction_date) AS d FROM trades
+           WHERE asset_type IN ('ST', 'Stock') AND ticker IS NOT NULL AND ticker != ''"""
+    ).fetchone()
+    return row["d"] if row else None
+
+
+def set_benchmark_prices(conn: sqlite3.Connection, prices: list[tuple[str, float]]) -> None:
+    """Bulk-loads (date, price) pairs into benchmark_prices in one batch commit - this is a
+    one-time backfill of a few thousand rows, not a per-row recurring write."""
+    for date, price in prices:
+        conn.execute(
+            """INSERT INTO benchmark_prices (date, price) VALUES (?, ?)
+               ON CONFLICT (date) DO UPDATE SET price = excluded.price""",
+            (date, price),
+        )
+    conn.commit()
+
+
 def backfill_delisted_status(conn: sqlite3.Connection) -> int:
     """One-time labeling pass: gives every ticker with zero historical price data anywhere
     (already excluded from get_tickers_due_for_price_check's queue by construction) an

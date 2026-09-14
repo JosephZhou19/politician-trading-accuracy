@@ -633,3 +633,26 @@ def test_record_functions_can_defer_commit(conn):
     # Uncommitted writes are still visible on the same connection (no separate reader here),
     # so this mainly confirms the call succeeds without raising when commit=False.
     assert models.get_ticker_price(conn, "AAPL").current_price == 100.0
+
+
+def test_earliest_stock_trade_date_ignores_non_stock_and_unticketed(conn):
+    _insert_priced_trade(conn, "AAPL")
+    conn.execute(
+        "UPDATE trades SET transaction_date = '2015-06-01' WHERE ticker = 'AAPL'"
+    )
+    conn.commit()
+    assert models.get_earliest_stock_trade_date(conn) == "2015-06-01"
+
+
+def test_earliest_stock_trade_date_none_when_no_stock_trades(conn):
+    assert models.get_earliest_stock_trade_date(conn) is None
+
+
+def test_set_benchmark_prices_round_trip_and_upsert(conn):
+    models.set_benchmark_prices(conn, [("2020-01-02", 100.0), ("2020-01-03", 101.0)])
+    rows = conn.execute("SELECT * FROM benchmark_prices ORDER BY date").fetchall()
+    assert [(r["date"], r["price"]) for r in rows] == [("2020-01-02", 100.0), ("2020-01-03", 101.0)]
+
+    models.set_benchmark_prices(conn, [("2020-01-02", 105.0)])  # re-run should update, not duplicate
+    rows = conn.execute("SELECT * FROM benchmark_prices ORDER BY date").fetchall()
+    assert [(r["date"], r["price"]) for r in rows] == [("2020-01-02", 105.0), ("2020-01-03", 101.0)]

@@ -126,6 +126,18 @@ CREATE TABLE IF NOT EXISTS trickle_cursor (
     last_ticker TEXT
 );
 
+-- SPY's daily Open price (dividend-adjusted, matching how every individual stock's price
+-- is fetched - a fair benchmark comparison needs the same adjustment convention on both
+-- sides) - one row per actual trading day, written once by a one-time backfill, never
+-- duplicated onto individual trades. Alpha vs. this benchmark is computed in the views via
+-- a cheap indexed lookup (date is the primary key) using the same "roll forward to the next
+-- trading day" logic as TickerHistory.price_on_or_after, not a plain equality join - trade
+-- dates that fall on a weekend/holiday need the next available trading day's price.
+CREATE TABLE IF NOT EXISTS benchmark_prices (
+    date  TEXT PRIMARY KEY,
+    price REAL NOT NULL
+);
+
 -- Per (legislator, ticker) estimated current stock position - a view, not a materialized
 -- table, to keep a single source of truth (no cached value that could drift from the
 -- trades/ticker_prices it's derived from). Cheap when queried scoped to one legislator_id -
@@ -221,6 +233,7 @@ SELECT
          THEN (julianday(last_stock_trade_date) - julianday(first_stock_trade_date)) / 365.25
     END AS years_active,
     total_stock_dollar_volume,
+    trades_with_alpha_data, avg_1yr_alpha_pct,
     distinct_tickers_held, total_stock_buy_count, total_stock_sell_count,
     stock_net_worth, stock_total_cost_basis,
     CASE WHEN stock_net_worth IS NOT NULL THEN stock_net_worth - stock_total_cost_basis END AS total_estimated_gain,
@@ -256,6 +269,42 @@ FROM (
          WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
            AND t.ticker IS NOT NULL AND t.ticker != ''
            AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')) AS total_stock_dollar_volume,
+
+        -- All-time alpha vs. SPY (same fixed-window, dollar-weighted methodology as
+        -- politician_yearly_activity's avg_1yr_alpha_pct - see that view's header comment
+        -- for why this normalizes for tenure, not just market conditions). Deliberately
+        -- inlined per-trade rather than referencing politician_yearly_activity: same
+        -- predicate-pushdown reasoning as the rest of this view.
+        (SELECT COUNT(*) FROM trades t JOIN filings f ON f.id = t.filing_id
+         WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
+           AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
+           AND (SELECT price FROM benchmark_prices WHERE date >= t.transaction_date
+                  AND date <= date(t.transaction_date, '+10 days') ORDER BY date ASC LIMIT 1) IS NOT NULL
+           AND (SELECT price FROM benchmark_prices WHERE date >= date(t.transaction_date, '+365 days')
+                  AND date <= date(t.transaction_date, '+375 days') ORDER BY date ASC LIMIT 1) IS NOT NULL
+        ) AS trades_with_alpha_data,
+
+        -- SQLite has no LATERAL join (confirmed directly: "near SELECT: syntax error") -
+        -- the per-trade SPY lookups are computed once in this derived table's SELECT list
+        -- instead, same as politician_yearly_activity's per_trade CTE.
+        (SELECT
+            SUM(CASE WHEN spy_txn IS NOT NULL AND spy_365d IS NOT NULL
+                     THEN ((price_365d - price_at_transaction) / price_at_transaction
+                           - (spy_365d - spy_txn) / spy_txn) * amount_mid
+                ELSE 0 END)
+            / NULLIF(SUM(CASE WHEN spy_txn IS NOT NULL AND spy_365d IS NOT NULL THEN amount_mid ELSE 0 END), 0) * 100
+         FROM (
+             SELECT t.price_at_transaction, t.price_365d,
+                 (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 AS amount_mid,
+                 (SELECT price FROM benchmark_prices WHERE date >= t.transaction_date
+                    AND date <= date(t.transaction_date, '+10 days') ORDER BY date ASC LIMIT 1) AS spy_txn,
+                 (SELECT price FROM benchmark_prices WHERE date >= date(t.transaction_date, '+365 days')
+                    AND date <= date(t.transaction_date, '+375 days') ORDER BY date ASC LIMIT 1) AS spy_365d
+             FROM trades t JOIN filings f ON f.id = t.filing_id
+             WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
+               AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
+         )
+        ) AS avg_1yr_alpha_pct,
 
         -- Each of the next six subqueries requires an active ticker_prices row (matching
         -- politician_ticker_positions' exact "held" scope) - see the header comment above.
@@ -369,52 +418,100 @@ FROM (
 -- Recent years will show partial or NULL 1yr figures until a full 365 days has actually
 -- elapsed since those trades - expected, not a bug. trades_with_1yr_data is the trust
 -- indicator: a low count means don't read much into that year's return/win-rate figures.
+--
+-- Alpha vs. S&P 500 (avg_1yr_alpha_pct / alpha_win_rate_1yr_pct) answers the "someone who's
+-- been doing this for years isn't automatically ranked higher than someone who started
+-- recently" problem: each trade's own 1yr return is compared only against what SPY did
+-- over that SAME fixed window, not against another trade's window or today's price - a
+-- 2015 trade and a 2024 trade are equally comparable, each only needing to beat the market
+-- during its own year. The two SPY lookups (per trade, not per aggregate expression - see
+-- the per_trade CTE) use the same "roll forward to the next trading day" logic as
+-- TickerHistory.price_on_or_after, expressed as an indexed range scan (date is the primary
+-- key on benchmark_prices) rather than requiring an exact date match.
 DROP VIEW IF EXISTS politician_yearly_activity;
 CREATE VIEW politician_yearly_activity AS
+WITH per_trade AS (
+    SELECT
+        f.legislator_id,
+        CAST(strftime('%Y', t.transaction_date) AS INTEGER) AS year,
+        t.asset_type, t.transaction_type, t.ticker, t.price_at_transaction, t.price_365d,
+        (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 AS amount_mid,
+        CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase' THEN
+            (SELECT price FROM benchmark_prices
+             WHERE date >= t.transaction_date AND date <= date(t.transaction_date, '+10 days')
+             ORDER BY date ASC LIMIT 1)
+        END AS spy_price_at_transaction,
+        CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase' THEN
+            (SELECT price FROM benchmark_prices
+             WHERE date >= date(t.transaction_date, '+365 days') AND date <= date(t.transaction_date, '+375 days')
+             ORDER BY date ASC LIMIT 1)
+        END AS spy_price_365d
+    FROM trades t
+    JOIN filings f ON f.id = t.filing_id
+)
 SELECT
-    f.legislator_id,
+    p.legislator_id,
     l.first_name, l.last_name, l.chamber,
-    CAST(strftime('%Y', t.transaction_date) AS INTEGER) AS year,
+    p.year,
 
     COUNT(*) AS total_trades_all_types,
 
-    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
+    SUM(CASE WHEN p.asset_type IN ('ST', 'Stock') AND p.transaction_type = 'purchase'
              THEN 1 ELSE 0 END) AS stock_buy_count,
-    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type IN ('sale_full', 'sale_partial')
+    SUM(CASE WHEN p.asset_type IN ('ST', 'Stock') AND p.transaction_type IN ('sale_full', 'sale_partial')
              THEN 1 ELSE 0 END) AS stock_sell_count,
 
-    COUNT(DISTINCT CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.ticker IS NOT NULL AND t.ticker != ''
-                        THEN t.ticker END) AS distinct_tickers_traded,
+    COUNT(DISTINCT CASE WHEN p.asset_type IN ('ST', 'Stock') AND p.ticker IS NOT NULL AND p.ticker != ''
+                        THEN p.ticker END) AS distinct_tickers_traded,
 
-    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
-             THEN (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 ELSE 0 END) AS total_stock_dollar_volume,
+    SUM(CASE WHEN p.asset_type IN ('ST', 'Stock') AND p.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+             THEN p.amount_mid ELSE 0 END) AS total_stock_dollar_volume,
 
-    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
-             AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
+    SUM(CASE WHEN p.asset_type IN ('ST', 'Stock') AND p.transaction_type = 'purchase'
+             AND p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
              THEN 1 ELSE 0 END) AS trades_with_1yr_data,
 
-    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
-             AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
-             THEN (t.price_365d - t.price_at_transaction) / t.price_at_transaction
-                  * (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0
+    SUM(CASE WHEN p.asset_type IN ('ST', 'Stock') AND p.transaction_type = 'purchase'
+             AND p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
+             THEN (p.price_365d - p.price_at_transaction) / p.price_at_transaction * p.amount_mid
              ELSE 0 END)
-      / NULLIF(SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
-                        AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
-                        THEN (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0
-                   ELSE 0 END), 0) * 100 AS avg_1yr_return_pct,
+      / NULLIF(SUM(CASE WHEN p.asset_type IN ('ST', 'Stock') AND p.transaction_type = 'purchase'
+                        AND p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
+                   THEN p.amount_mid ELSE 0 END), 0) * 100 AS avg_1yr_return_pct,
 
-    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
-             AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
-             AND t.price_365d > t.price_at_transaction
+    SUM(CASE WHEN p.asset_type IN ('ST', 'Stock') AND p.transaction_type = 'purchase'
+             AND p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
+             AND p.price_365d > p.price_at_transaction
              THEN 1 ELSE 0 END) * 100.0
-      / NULLIF(SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
-                        AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
-                   THEN 1 ELSE 0 END), 0) AS win_rate_1yr_pct
+      / NULLIF(SUM(CASE WHEN p.asset_type IN ('ST', 'Stock') AND p.transaction_type = 'purchase'
+                        AND p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
+                   THEN 1 ELSE 0 END), 0) AS win_rate_1yr_pct,
 
-FROM trades t
-JOIN filings f ON f.id = t.filing_id
-JOIN legislators l ON l.id = f.legislator_id
-GROUP BY f.legislator_id, year;
+    SUM(CASE WHEN p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
+             AND p.spy_price_at_transaction IS NOT NULL AND p.spy_price_365d IS NOT NULL
+             THEN 1 ELSE 0 END) AS trades_with_alpha_data,
+
+    SUM(CASE WHEN p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
+             AND p.spy_price_at_transaction IS NOT NULL AND p.spy_price_365d IS NOT NULL
+             THEN ((p.price_365d - p.price_at_transaction) / p.price_at_transaction
+                   - (p.spy_price_365d - p.spy_price_at_transaction) / p.spy_price_at_transaction) * p.amount_mid
+             ELSE 0 END)
+      / NULLIF(SUM(CASE WHEN p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
+                        AND p.spy_price_at_transaction IS NOT NULL AND p.spy_price_365d IS NOT NULL
+                   THEN p.amount_mid ELSE 0 END), 0) * 100 AS avg_1yr_alpha_pct,
+
+    SUM(CASE WHEN p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
+             AND p.spy_price_at_transaction IS NOT NULL AND p.spy_price_365d IS NOT NULL
+             AND (p.price_365d - p.price_at_transaction) / p.price_at_transaction
+                 > (p.spy_price_365d - p.spy_price_at_transaction) / p.spy_price_at_transaction
+             THEN 1 ELSE 0 END) * 100.0
+      / NULLIF(SUM(CASE WHEN p.price_at_transaction IS NOT NULL AND p.price_365d IS NOT NULL
+                        AND p.spy_price_at_transaction IS NOT NULL AND p.spy_price_365d IS NOT NULL
+                   THEN 1 ELSE 0 END), 0) AS alpha_win_rate_1yr_pct
+
+FROM per_trade p
+JOIN legislators l ON l.id = p.legislator_id
+GROUP BY p.legislator_id, p.year;
 
 -- One row per scraper invocation, for observability once ingestion runs on a schedule.
 CREATE TABLE IF NOT EXISTS ingestion_runs (
