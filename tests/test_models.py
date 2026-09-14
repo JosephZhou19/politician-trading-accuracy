@@ -656,3 +656,75 @@ def test_set_benchmark_prices_round_trip_and_upsert(conn):
     models.set_benchmark_prices(conn, [("2020-01-02", 105.0)])  # re-run should update, not duplicate
     rows = conn.execute("SELECT * FROM benchmark_prices ORDER BY date").fetchall()
     assert [(r["date"], r["price"]) for r in rows] == [("2020-01-02", 105.0), ("2020-01-03", 101.0)]
+
+
+def _insert_trade_with_prices(conn, ticker, *, transaction_date="2020-01-05",
+                               notification_date="2020-01-20", **price_columns):
+    trade_id = models.insert_trade(
+        conn, filing_id=_insert_test_filing(conn, external_filing_id=f"filing-{ticker}-{transaction_date}"),
+        source_row_number=1, ticker=ticker, asset_name=f"{ticker} Inc.", asset_type="Stock",
+        transaction_type="purchase", transaction_date=transaction_date,
+        notification_date=notification_date, amount_low=1000, owner="self",
+    )
+    if price_columns:
+        models.set_trade_prices(conn, trade_id, price_columns)
+    return trade_id
+
+
+def test_needing_prices_excludes_fully_priced_trade(conn):
+    _insert_trade_with_prices(conn, "AAPL", price_at_transaction=100.0, price_at_notification=100.0,
+                              price_30d=100.0, price_90d=100.0, price_180d=100.0, price_365d=100.0)
+    assert models.get_trades_needing_prices(conn, today="2026-01-01") == []
+
+
+def test_needing_prices_includes_trade_missing_transaction_price_regardless_of_date(conn):
+    _insert_trade_with_prices(conn, "AAPL")  # no prices at all
+    trades = models.get_trades_needing_prices(conn, today="2020-01-06")
+    assert len(trades) == 1
+
+
+def test_needing_prices_excludes_horizon_not_yet_arrived(conn):
+    """Regression: a horizon whose date hasn't arrived yet (per the SAME `today` reference
+    used here) must not appear in the queue, even if every earlier price is already set -
+    confirmed for real against production that a mismatched 'today' (SQLite's UTC
+    date('now') vs. the backfill script's local date) silently included premature trades,
+    wasting a real yfinance fetch for a ticker with nothing actually fillable yet."""
+    _insert_trade_with_prices(
+        conn, "AAPL", transaction_date="2026-06-16",
+        price_at_transaction=100.0, price_at_notification=100.0, price_30d=100.0,
+    )
+    # 90-day horizon is 2026-09-14; "today" one day earlier must not include it yet.
+    assert models.get_trades_needing_prices(conn, today="2026-09-13") == []
+    assert len(models.get_trades_needing_prices(conn, today="2026-09-14")) == 1
+
+
+def test_needing_prices_default_today_uses_local_date_not_utc(conn):
+    """The whole point of the fix: with no explicit `today`, this must match Python's local
+    date(), not SQLite's date('now') (UTC) - the two can disagree by a full day."""
+    local_today = datetime.date.today()
+    _insert_trade_with_prices(
+        conn, "AAPL", transaction_date=(local_today - datetime.timedelta(days=100)).isoformat(),
+        price_at_transaction=100.0, price_at_notification=100.0,
+    )
+    # 90-day horizon already passed relative to local today - must show up with no `today` passed.
+    assert len(models.get_trades_needing_prices(conn)) == 1
+
+
+def test_needing_prices_excludes_confirmed_delisted_ticker(conn):
+    """Regression: retrying a ticker already confirmed to have zero yfinance data forever
+    wastes a real fetch on every single run for no possible benefit - confirmed for real
+    against production (776 delisted tickers being silently retried every run)."""
+    _insert_trade_with_prices(conn, "DEAD")  # no prices - would otherwise be in the queue
+    checked_at = "2026-01-01T00:00:00Z"
+    for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD):
+        models.record_zero_response(conn, "DEAD", checked_at)
+    assert models.get_ticker_price(conn, "DEAD").price_status == "delisted"
+
+    assert models.get_trades_needing_prices(conn, today="2026-01-01") == []
+
+
+def test_needing_prices_still_includes_active_ticker_with_no_price_row(conn):
+    """The delisted exclusion must not accidentally exclude tickers that simply don't have
+    a ticker_prices row yet (the normal case for a trade never priced before)."""
+    _insert_trade_with_prices(conn, "AAPL")
+    assert len(models.get_trades_needing_prices(conn, today="2020-01-06")) == 1

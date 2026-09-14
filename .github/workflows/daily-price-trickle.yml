@@ -33,6 +33,22 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # Both run before the trickle step, not after: fast/predictable catch-up work first,
+      # the long-running (up to 75-minute budget) trickle step last, so a slow trickle run
+      # never blocks or delays these. Neither uses Finnhub - both are yfinance, same as the
+      # original historical backfill. backfill_spy_benchmark is incremental (a handful of
+      # rows in steady state, not the whole ~3,500-row history) so this stays fast day to
+      # day; the one large catch-up of the pre-existing backlog was run manually first.
+      - run: python -m scripts.backfill_prices
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+
+      - run: python -m scripts.backfill_spy_benchmark
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+
       - run: python -m scripts.update_current_prices
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}

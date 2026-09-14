@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from src.db import models
 from src.market.prices import TickerHistory
-from scripts.backfill_spy_benchmark import backfill_spy_benchmark
+from scripts.backfill_spy_benchmark import OVERLAP_DAYS, backfill_spy_benchmark
 
 
 def _insert_stock_trade(conn, ticker, transaction_date):
@@ -60,3 +60,24 @@ def test_backfill_raises_if_spy_fetch_fails(conn):
             assert False, "expected RuntimeError"
         except RuntimeError:
             pass
+
+
+def test_recurring_run_only_fetches_since_the_latest_stored_date(conn):
+    """The whole point of making this incremental: a run after data already exists must
+    not re-fetch/re-write the full history - only a small overlap window forward."""
+    _insert_stock_trade(conn, "AAPL", "2015-01-05")  # would drive a much earlier start otherwise
+    models.set_benchmark_prices(conn, [("2026-08-01", 500.0)])
+
+    fake_history = TickerHistory("SPY", None, price_type="open")
+    fake_history.daily_prices = lambda: [(datetime.date(2026, 8, 3), 502.0)]
+
+    with patch("scripts.backfill_spy_benchmark.fetch_ticker_history", return_value=fake_history) as mock_fetch:
+        count = backfill_spy_benchmark(conn)
+
+    assert count == 1
+    called_ticker, called_start, _called_end = mock_fetch.call_args[0]
+    assert called_ticker == "SPY"
+    assert called_start == datetime.date(2026, 8, 1) - datetime.timedelta(days=OVERLAP_DAYS)
+
+    rows = conn.execute("SELECT * FROM benchmark_prices ORDER BY date").fetchall()
+    assert [(r["date"], r["price"]) for r in rows] == [("2026-08-01", 500.0), ("2026-08-03", 502.0)]

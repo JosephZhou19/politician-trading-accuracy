@@ -54,7 +54,7 @@ def _target_dates(trade, today):
 
 def backfill(conn, ticker_limit=None, use_stockanalysis_fallback=False):
     today = datetime.date.today()
-    trades = models.get_trades_needing_prices(conn)
+    trades = models.get_trades_needing_prices(conn, today=today.isoformat())
     by_ticker = defaultdict(list)
     for trade in trades:
         by_ticker[trade.ticker].append(trade)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import sqlite3
@@ -476,21 +477,36 @@ def set_trade_prices(conn: sqlite3.Connection, trade_id: int, prices: dict, *, c
         conn.commit()
 
 
-def get_trades_needing_prices(conn: sqlite3.Connection) -> list[Trade]:
+def get_trades_needing_prices(conn: sqlite3.Connection, today: Optional[str] = None) -> list[Trade]:
     """Ticker'd trades with at least one currently-fetchable price still unset: transaction/
     notification price (always fetchable - both dates are already in the past by the time a
     trade exists at all), or a 30/90/180/365-day horizon whose date has now arrived. This is
     the shared work queue for both the one-time historical backfill and the daily catch-up
-    job - the same trade can reappear here across several days as later horizons arrive."""
+    job - the same trade can reappear here across several days as later horizons arrive.
+
+    today defaults to Python's local date, not SQLite's date('now') (which is UTC) -
+    confirmed these disagree for several hours every evening in US time zones, which was
+    silently inflating this queue with trades whose horizon looked arrived here but wasn't
+    once backfill_prices.py's own (local-time) date check ran, wasting a real yfinance
+    fetch for no benefit. Also excludes tickers already confirmed permanently delisted
+    (backfill_delisted_status) - retrying a ticker with zero yfinance data forever wastes a
+    fetch on every single run for no possible benefit."""
+    if today is None:
+        today = datetime.date.today().isoformat()
     horizon_conditions = " OR ".join(
-        f"({col} IS NULL AND date(transaction_date, '+{days} days') <= date('now'))"
+        f"({col} IS NULL AND date(transaction_date, '+{days} days') <= date(?))"
         for col, days in HORIZON_COLUMNS
     )
+    params = [today] * len(HORIZON_COLUMNS)
     rows = conn.execute(
-        f"""SELECT * FROM trades WHERE ticker IS NOT NULL AND ticker != '' AND (
-                price_at_transaction IS NULL OR price_at_notification IS NULL
+        f"""SELECT * FROM trades t WHERE t.ticker IS NOT NULL AND t.ticker != '' AND (
+                t.price_at_transaction IS NULL OR t.price_at_notification IS NULL
                 OR {horizon_conditions}
-            )"""
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'delisted'
+            )""",
+        params,
     ).fetchall()
     return [_row_to_trade(row) for row in rows]
 
@@ -611,11 +627,18 @@ def set_trickle_cursor(conn: sqlite3.Connection, last_ticker: Optional[str]) -> 
 
 def get_earliest_stock_trade_date(conn: sqlite3.Connection) -> Optional[str]:
     """Earliest transaction_date needing a benchmark price - drives how far back the
-    one-time SPY backfill needs to fetch."""
+    first-ever SPY backfill needs to fetch, when benchmark_prices is still empty."""
     row = conn.execute(
         """SELECT MIN(transaction_date) AS d FROM trades
            WHERE asset_type IN ('ST', 'Stock') AND ticker IS NOT NULL AND ticker != ''"""
     ).fetchone()
+    return row["d"] if row else None
+
+
+def get_latest_benchmark_date(conn: sqlite3.Connection) -> Optional[str]:
+    """Most recent date already in benchmark_prices - drives how far back a recurring SPY
+    catch-up run needs to re-fetch (a small window, not the whole history)."""
+    row = conn.execute("SELECT MAX(date) AS d FROM benchmark_prices").fetchone()
     return row["d"] if row else None
 
 
