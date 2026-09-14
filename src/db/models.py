@@ -603,26 +603,25 @@ def get_tickers_due_for_price_check(conn: sqlite3.Connection) -> list[str]:
     to skip 'delisted' tickers except on their once-a-month safety-net recheck. Ordered by
     ticker so the trickle job's resume cursor (a bookmark by ticker value) is deterministic
     across runs even as the underlying set of due tickers shifts."""
+    # priced_tickers is computed once (a single pass over trades) rather than as a
+    # correlated EXISTS re-evaluated per trade row - see PLAN.md.
     rows = conn.execute(
         f"""
-        SELECT DISTINCT t.ticker FROM trades t
-        LEFT JOIN ticker_prices tp ON tp.ticker = t.ticker
-        WHERE t.ticker IS NOT NULL AND t.ticker != ''
-          AND EXISTS (
-              SELECT 1 FROM trades t2 WHERE t2.ticker = t.ticker AND (
-                  t2.price_at_transaction IS NOT NULL OR t2.price_at_notification IS NOT NULL
-                  OR t2.price_30d IS NOT NULL OR t2.price_90d IS NOT NULL
-                  OR t2.price_180d IS NOT NULL OR t2.price_365d IS NOT NULL
-              )
-          )
-          AND (
-              tp.ticker IS NULL
-              OR tp.price_status = 'active'
-              OR (tp.price_status = 'delisted'
-                  AND (tp.last_checked_at IS NULL
-                       OR julianday('now') - julianday(tp.last_checked_at) >= {DELISTED_RECHECK_DAYS}))
-          )
-        ORDER BY t.ticker
+        WITH priced_tickers AS (
+            SELECT DISTINCT ticker FROM trades
+            WHERE ticker IS NOT NULL AND ticker != ''
+              AND (price_at_transaction IS NOT NULL OR price_at_notification IS NOT NULL
+                   OR price_30d IS NOT NULL OR price_90d IS NOT NULL
+                   OR price_180d IS NOT NULL OR price_365d IS NOT NULL)
+        )
+        SELECT pt.ticker FROM priced_tickers pt
+        LEFT JOIN ticker_prices tp ON tp.ticker = pt.ticker
+        WHERE tp.ticker IS NULL
+           OR tp.price_status = 'active'
+           OR (tp.price_status = 'delisted'
+               AND (tp.last_checked_at IS NULL
+                    OR julianday('now') - julianday(tp.last_checked_at) >= {DELISTED_RECHECK_DAYS}))
+        ORDER BY pt.ticker
         """
     ).fetchall()
     return [row["ticker"] for row in rows]
