@@ -126,6 +126,142 @@ CREATE TABLE IF NOT EXISTS trickle_cursor (
     last_ticker TEXT
 );
 
+-- Per (legislator, ticker) estimated current stock position - a view, not a materialized
+-- table, to keep a single source of truth (no cached value that could drift from the
+-- trades/ticker_prices it's derived from). Cheap when queried scoped to one legislator_id -
+-- confirmed via EXPLAIN QUERY PLAN that the filter pushes down to indexed lookups on
+-- filings/trades/ticker_prices rather than aggregating the whole trade history first; an
+-- unscoped query against this view does scan the full stock-trade history, so callers
+-- should prefer `WHERE legislator_id = ?`. Dropped and recreated on every connect() (safe -
+-- a view holds no data of its own) so its definition always matches this file exactly,
+-- with no separate migration bookkeeping needed.
+DROP VIEW IF EXISTS politician_ticker_positions;
+CREATE VIEW politician_ticker_positions AS
+WITH scoped_trades AS (
+    SELECT
+        f.legislator_id,
+        t.ticker,
+        t.transaction_type,
+        t.transaction_date,
+        t.price_at_transaction,
+        (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 AS amount_mid
+    FROM trades t
+    JOIN filings f ON f.id = t.filing_id
+    WHERE t.asset_type IN ('ST', 'Stock')
+      AND t.ticker IS NOT NULL AND t.ticker != ''
+      AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+),
+aggregated AS (
+    SELECT
+        legislator_id, ticker,
+        SUM(CASE WHEN transaction_type = 'purchase' THEN amount_mid ELSE -amount_mid END) AS net_position_estimate,
+        SUM(CASE WHEN transaction_type = 'purchase' THEN 1 ELSE 0 END) AS buy_count,
+        SUM(CASE WHEN transaction_type != 'purchase' THEN 1 ELSE 0 END) AS sell_count,
+        MAX(transaction_date) AS latest_trade_date,
+        SUM(CASE WHEN transaction_type = 'purchase' AND price_at_transaction IS NOT NULL
+                  THEN price_at_transaction * amount_mid ELSE 0 END)
+          / NULLIF(SUM(CASE WHEN transaction_type = 'purchase' AND price_at_transaction IS NOT NULL
+                        THEN amount_mid ELSE 0 END), 0) AS avg_cost
+    FROM scoped_trades
+    GROUP BY legislator_id, ticker
+)
+SELECT
+    l.id AS legislator_id, l.first_name, l.last_name, l.chamber,
+    a.ticker, a.net_position_estimate, a.buy_count, a.sell_count,
+    a.latest_trade_date, a.avg_cost, tp.current_price,
+    CASE WHEN a.avg_cost IS NOT NULL AND tp.current_price IS NOT NULL
+         THEN a.net_position_estimate * (tp.current_price - a.avg_cost) / a.avg_cost
+    END AS estimated_gain
+FROM aggregated a
+JOIN legislators l ON l.id = a.legislator_id
+JOIN ticker_prices tp ON tp.ticker = a.ticker
+WHERE a.net_position_estimate > 0
+  AND tp.price_status = 'active';
+
+-- Per-legislator totals: total trades across every asset type (not just stock - "how active
+-- a trader is this person overall" is a different question from the stock-specific view
+-- above), plus stock-only totals (net worth, buy/sell counts, distinct tickers currently
+-- held). stock_net_worth is NULL (not 0) when every held position lacks a cost basis, and
+-- also NULL when the legislator holds no stock at all - distinct_tickers_held (0 vs >0)
+-- disambiguates the two.
+--
+-- Deliberately does NOT query politician_ticker_positions (confirmed via EXPLAIN QUERY
+-- PLAN, not assumed): referencing a view that itself has a GROUP BY from inside another
+-- view/subquery defeats predicate pushdown entirely - SQLite fully materializes that inner
+-- view for every legislator before applying an outer legislator_id filter, the exact
+-- expensive-scan problem this design is meant to avoid. Inlining the same position logic
+-- directly as correlated subqueries (verified: each one uses indexed SEARCHes scoped to
+-- just one legislator, never a full scan) fixes it, at the cost of duplicating that SQL
+-- rather than reusing the other view's definition - a deliberate trade of DRY-ness for a
+-- real, measured cost difference, not a stylistic preference.
+--
+-- Same drop-and-recreate-on-every-connect() approach as the view above (a view holds no
+-- data, so this is free and keeps the definition always in sync with this file).
+DROP VIEW IF EXISTS politician_totals;
+CREATE VIEW politician_totals AS
+SELECT
+    l.id AS legislator_id, l.first_name, l.last_name, l.chamber,
+
+    (SELECT COUNT(*) FROM trades t JOIN filings f ON f.id = t.filing_id
+     WHERE f.legislator_id = l.id) AS total_trades_all_types,
+
+    (SELECT MAX(t.transaction_date) FROM trades t JOIN filings f ON f.id = t.filing_id
+     WHERE f.legislator_id = l.id) AS latest_trade_date,
+
+    -- Each of the next three subqueries requires an active ticker_prices row (matching
+    -- politician_ticker_positions' exact scope) - caught via a real discrepancy (54 vs 64)
+    -- while verifying against production: without this, distinct_tickers_held silently
+    -- counted delisted/unpriced tickers that the position view excludes, giving two "current
+    -- holdings" numbers that disagreed with each other.
+    (SELECT COUNT(*) FROM (
+        SELECT t.ticker,
+            SUM(CASE WHEN t.transaction_type = 'purchase'
+                     THEN (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0
+                     ELSE -(t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 END) AS net_pos
+        FROM trades t JOIN filings f ON f.id = t.filing_id
+        WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+          AND t.ticker IS NOT NULL AND t.ticker != ''
+          AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+          AND EXISTS (SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'active')
+        GROUP BY t.ticker HAVING net_pos > 0
+    )) AS distinct_tickers_held,
+
+    (SELECT COALESCE(SUM(CASE WHEN t.transaction_type = 'purchase' THEN 1 ELSE 0 END), 0)
+     FROM trades t JOIN filings f ON f.id = t.filing_id
+     WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+       AND t.ticker IS NOT NULL AND t.ticker != ''
+       AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+       AND EXISTS (SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'active')) AS total_stock_buy_count,
+
+    (SELECT COALESCE(SUM(CASE WHEN t.transaction_type != 'purchase' THEN 1 ELSE 0 END), 0)
+     FROM trades t JOIN filings f ON f.id = t.filing_id
+     WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+       AND t.ticker IS NOT NULL AND t.ticker != ''
+       AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+       AND EXISTS (SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'active')) AS total_stock_sell_count,
+
+    (SELECT SUM(pos.net_pos * tp.current_price / pos.avg_cost) FROM (
+        SELECT s.ticker,
+            SUM(CASE WHEN s.transaction_type = 'purchase' THEN s.amount_mid ELSE -s.amount_mid END) AS net_pos,
+            SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
+                     THEN s.price_at_transaction * s.amount_mid ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
+                           THEN s.amount_mid ELSE 0 END), 0) AS avg_cost
+        FROM (
+            SELECT t.ticker, t.transaction_type, t.price_at_transaction,
+                (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 AS amount_mid
+            FROM trades t JOIN filings f ON f.id = t.filing_id
+            WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+              AND t.ticker IS NOT NULL AND t.ticker != ''
+              AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+        ) s
+        GROUP BY s.ticker
+    ) pos
+    JOIN ticker_prices tp ON tp.ticker = pos.ticker
+    WHERE pos.net_pos > 0 AND pos.avg_cost IS NOT NULL AND tp.price_status = 'active') AS stock_net_worth
+
+FROM legislators l;
+
 -- One row per scraper invocation, for observability once ingestion runs on a schedule.
 CREATE TABLE IF NOT EXISTS ingestion_runs (
     id              INTEGER PRIMARY KEY,
