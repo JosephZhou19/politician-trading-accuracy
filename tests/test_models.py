@@ -49,6 +49,45 @@ def test_filing_round_trip(conn):
     assert fetched.parse_status == "pending"
 
 
+def test_get_filing_statuses_by_chamber_returns_id_and_status_by_ext_id(conn):
+    leg_id = models.get_or_create_legislator(conn, "Alan", "Armstrong", "senate", "member")
+    house_leg_id = models.get_or_create_legislator(conn, "Josh", "Gottheimer", "house", "member")
+
+    senate_filing_id = models.insert_filing(
+        conn,
+        legislator_id=leg_id,
+        chamber="senate",
+        external_filing_id="abc-123",
+        filing_type="ptr",
+        is_amendment=False,
+        filing_date="2026-07-21",
+        source_url="https://efdsearch.senate.gov/search/view/ptr/abc-123/",
+        document_format="html",
+        fetched_at="2026-09-05T00:00:00",
+    )
+    models.update_filing_parse_status(conn, senate_filing_id, "parsed")
+    # A House filing with the *same* external_filing_id must not collide - the lookup is
+    # scoped per chamber, same as get_filing_by_external_id.
+    models.insert_filing(
+        conn,
+        legislator_id=house_leg_id,
+        chamber="house",
+        external_filing_id="abc-123",
+        filing_type="ptr",
+        is_amendment=False,
+        source_url="https://disclosures-clerk.house.gov/abc-123.pdf",
+        document_format="pdf",
+        fetched_at="2026-09-05T00:00:00",
+    )
+
+    statuses = models.get_filing_statuses_by_chamber(conn, "senate")
+    assert statuses == {"abc-123": (senate_filing_id, "parsed")}
+
+
+def test_get_filing_statuses_by_chamber_empty_when_none_ingested(conn):
+    assert models.get_filing_statuses_by_chamber(conn, "house") == {}
+
+
 def _insert_test_filing(conn, external_filing_id="abc-123"):
     leg_id = models.get_or_create_legislator(conn, "Alan", "Armstrong", "senate", "member")
     return models.insert_filing(

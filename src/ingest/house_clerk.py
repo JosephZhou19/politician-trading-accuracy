@@ -114,10 +114,10 @@ def _insert_new_filing(conn, legislator_id, ext_id, row, pdf_file, pdf_bytes, no
 
 
 def _process_filing(conn, pdf_dir, row, existing_filing_id):
-    """Download and store one PTR. Returns 'parsed' or 'needs_ocr' (for a legacy
-    hand-filled/scanned form this parser doesn't handle - see UnparseableFormError).
-    Raises on any *unexpected* failure - the caller marks the filing 'failed' and moves
-    on, so one bad filing can't take down an hours-long bulk run."""
+    """Download and store one PTR. Returns (filing_id, 'parsed' | 'needs_ocr') ('needs_ocr'
+    for a legacy hand-filled/scanned form this parser doesn't handle - see
+    UnparseableFormError). Raises on any *unexpected* failure - the caller marks the filing
+    'failed' and moves on, so one bad filing can't take down an hours-long bulk run."""
     ext_id = external_filing_id(row["pdf_path"])
     pdf_bytes = download_pdf(row["pdf_path"])
     pdf_file = pdf_dir / f"{ext_id}.pdf"
@@ -139,7 +139,7 @@ def _process_filing(conn, pdf_dir, row, existing_filing_id):
             document_format="image",
         )
         models.update_filing_parse_status(conn, filing_id, "needs_ocr")
-        return "needs_ocr"
+        return filing_id, "needs_ocr"
 
     filer_status = house_ptr_parser.canonicalize_filer_status(parsed["filer_status_raw"])
     legislator_id = models.get_or_create_legislator(
@@ -164,17 +164,25 @@ def _process_filing(conn, pdf_dir, row, existing_filing_id):
     issues = sanity_checks.validate_trades(parsed["trades"])
     if issues:
         models.set_reconciliation_note(conn, filing_id, "; ".join(issues))
-    return "parsed"
+    return filing_id, "parsed"
 
 
-def ingest_ptrs(conn, data_dir, filing_year, last_name=""):
+def ingest_ptrs(conn, data_dir, filing_year, last_name="", existing_by_ext_id=None):
     """Search a filing year (optionally scoped to one last name), download and parse
     every new or previously-failed/pending PTR, and write legislators/filings/trades.
     One bad filing is logged and skipped rather than stopping the whole run - check
     `failures` in the returned summary, or `SELECT * FROM filings WHERE parse_status =
-    'failed'`, to see what needs attention."""
+    'failed'`, to see what needs attention.
+
+    `existing_by_ext_id` is the dedup dict from `models.get_filing_statuses_by_chamber`
+    (external_filing_id -> (id, parse_status)) - pass the same dict across every year in a
+    run so the skip-check for already-ingested filings never touches the DB, only the one
+    genuinely new/failed filing does. Built here as a fallback when omitted (standalone
+    calls, tests) - covers the whole chamber's history, same as the caller would build."""
     pdf_dir = Path(data_dir) / "raw" / "house"
     pdf_dir.mkdir(parents=True, exist_ok=True)
+    if existing_by_ext_id is None:
+        existing_by_ext_id = models.get_filing_statuses_by_chamber(conn, "house")
 
     summary = {
         "ptrs_found": 0, "ptrs_new": 0, "ptrs_skipped": 0,
@@ -186,18 +194,19 @@ def ingest_ptrs(conn, data_dir, filing_year, last_name=""):
         summary["ptrs_found"] += 1
 
         ext_id = external_filing_id(row["pdf_path"])
-        existing = models.get_filing_by_external_id(conn, "house", ext_id)
-        if existing and existing.parse_status in DONE_STATUSES:
+        existing_id, existing_status = existing_by_ext_id.get(ext_id, (None, None))
+        if existing_status in DONE_STATUSES:
             summary["ptrs_skipped"] += 1
             continue
 
         try:
-            status = _process_filing(conn, pdf_dir, row, existing.id if existing else None)
+            filing_id, status = _process_filing(conn, pdf_dir, row, existing_id)
             summary["ptrs_needs_ocr" if status == "needs_ocr" else "ptrs_new"] += 1
+            existing_by_ext_id[ext_id] = (filing_id, status)
         except Exception as e:
             logger.warning("Failed to process House PTR %s: %r", ext_id, e)
-            if existing:
-                models.update_filing_parse_status(conn, existing.id, "failed")
+            if existing_id:
+                models.update_filing_parse_status(conn, existing_id, "failed")
             summary["ptrs_failed"] += 1
             summary["failures"].append((ext_id, repr(e)))
         time.sleep(REQUEST_DELAY_SECONDS)

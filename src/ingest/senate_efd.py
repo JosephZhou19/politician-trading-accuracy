@@ -212,7 +212,7 @@ def _process_electronic_filing(session, conn, html_dir, parsed, legislator_id, s
     return filing_id
 
 
-def ingest_ptrs(conn, data_dir, filer_types=(FILER_TYPE_SENATOR,), last_name=""):
+def ingest_ptrs(conn, data_dir, filer_types=(FILER_TYPE_SENATOR,), last_name="", existing_by_ext_id=None):
     """Search PTRs for the given filer types and write legislators/filings/trades.
 
     Paper-filed reports (scanned images) are recorded as a filings row with
@@ -223,10 +223,17 @@ def ingest_ptrs(conn, data_dir, filer_types=(FILER_TYPE_SENATOR,), last_name="")
     One bad filing is logged and skipped rather than stopping the whole run - check
     `failures` in the returned summary, or `SELECT * FROM filings WHERE parse_status =
     'failed'`, to see what needs attention.
+
+    `existing_by_ext_id` is the dedup dict from `models.get_filing_statuses_by_chamber`
+    (external_filing_id -> (id, parse_status)) - pass it in so the skip-check for
+    already-ingested filings never touches the DB, only a genuinely new/failed filing
+    does. Built here as a fallback when omitted (standalone calls, tests).
     """
     html_dir = Path(data_dir) / "raw" / "senate"
     html_dir.mkdir(parents=True, exist_ok=True)
     session = new_session()
+    if existing_by_ext_id is None:
+        existing_by_ext_id = models.get_filing_statuses_by_chamber(conn, "senate")
     summary = {"found": 0, "new": 0, "skipped": 0, "paper": 0, "failed": 0, "failures": []}
 
     for filer_type in filer_types:
@@ -235,8 +242,10 @@ def ingest_ptrs(conn, data_dir, filer_types=(FILER_TYPE_SENATOR,), last_name="")
             parsed = parse_row(row)
             summary["found"] += 1
 
-            existing = models.get_filing_by_external_id(conn, "senate", parsed["external_filing_id"])
-            if existing and existing.parse_status in DONE_STATUSES:
+            existing_id, existing_status = existing_by_ext_id.get(
+                parsed["external_filing_id"], (None, None)
+            )
+            if existing_status in DONE_STATUSES:
                 summary["skipped"] += 1
                 continue
 
@@ -245,17 +254,18 @@ def ingest_ptrs(conn, data_dir, filer_types=(FILER_TYPE_SENATOR,), last_name="")
             )
             now = datetime.now(timezone.utc).isoformat()
             source_url = urljoin(BASE_URL, parsed["href"])
-            existing_id = existing.id if existing else None
 
             try:
                 if parsed["is_paper"]:
-                    _process_paper_filing(conn, parsed, legislator_id, source_url, now, existing_id)
+                    filing_id = _process_paper_filing(conn, parsed, legislator_id, source_url, now, existing_id)
                     summary["paper"] += 1
+                    existing_by_ext_id[parsed["external_filing_id"]] = (filing_id, "needs_ocr")
                 else:
-                    _process_electronic_filing(
+                    filing_id = _process_electronic_filing(
                         session, conn, html_dir, parsed, legislator_id, source_url, now, existing_id
                     )
                     summary["new"] += 1
+                    existing_by_ext_id[parsed["external_filing_id"]] = (filing_id, "parsed")
             except Exception as e:
                 logger.warning(
                     "Failed to process Senate PTR %s: %r", parsed["external_filing_id"], e

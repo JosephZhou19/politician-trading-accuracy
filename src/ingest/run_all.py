@@ -50,9 +50,13 @@ def run_house(conn, data_dir, start_year, end_year):
     totals = {"ptrs_found": 0, "ptrs_new": 0, "ptrs_skipped": 0, "ptrs_needs_ocr": 0, "ptrs_failed": 0}
     error_message = None
     try:
+        # Built once and reused across every year: the dedup check against this dict is
+        # in-memory, versus one Turso round-trip per already-ingested filing if each year
+        # re-fetched its own - see get_filing_statuses_by_chamber's docstring.
+        existing_by_ext_id = models.get_filing_statuses_by_chamber(conn, "house")
         for year in range(start_year, end_year + 1):
             logger.info("House: searching filing year %d", year)
-            summary = house_clerk.ingest_ptrs(conn, data_dir, year)
+            summary = house_clerk.ingest_ptrs(conn, data_dir, year, existing_by_ext_id=existing_by_ext_id)
             logger.info("House %d: %s", year, {k: v for k, v in summary.items() if k != "failures"})
             for key in totals:
                 totals[key] += summary[key]
@@ -86,7 +90,10 @@ def run_senate(conn, data_dir):
             senate_efd.FILER_TYPE_CANDIDATE,
             senate_efd.FILER_TYPE_FORMER_SENATOR,
         )
-        summary = senate_efd.ingest_ptrs(conn, data_dir, filer_types=filer_types)
+        existing_by_ext_id = models.get_filing_statuses_by_chamber(conn, "senate")
+        summary = senate_efd.ingest_ptrs(
+            conn, data_dir, filer_types=filer_types, existing_by_ext_id=existing_by_ext_id
+        )
         logger.info("Senate: %s", {k: v for k, v in summary.items() if k != "failures"})
         for key in totals:
             totals[key] += summary[key]

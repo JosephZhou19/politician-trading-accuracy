@@ -291,6 +291,23 @@ def get_filing_by_external_id(
     return _row_to_filing(row) if row else None
 
 
+def get_filing_statuses_by_chamber(
+    conn: sqlite3.Connection, chamber: str
+) -> dict[str, tuple[int, str]]:
+    """Bulk (external_filing_id -> (id, parse_status)) lookup for an entire chamber, in one
+    round trip. A scraper doing its usual per-filing_year (House) or per-filer-type (Senate)
+    dedup check via get_filing_by_external_id pays one Turso round-trip per candidate filing
+    it has *already* ingested - over a high-latency connection (e.g. GitHub Actions -> Turso,
+    ~120ms/call observed) that alone was the dominant cost of a full run (~11,700 calls,
+    ~20-25 minutes) even though each individual lookup is a cheap indexed SEARCH. Building
+    this dict once per chamber and checking it in-memory instead collapses that to one call."""
+    rows = conn.execute(
+        "SELECT external_filing_id, id, parse_status FROM filings WHERE chamber = ?",
+        (chamber,),
+    ).fetchall()
+    return {row["external_filing_id"]: (row["id"], row["parse_status"]) for row in rows}
+
+
 def insert_filing(
     conn: sqlite3.Connection,
     *,
