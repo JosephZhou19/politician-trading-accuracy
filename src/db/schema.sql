@@ -180,10 +180,17 @@ WHERE a.net_position_estimate > 0
 
 -- Per-legislator totals: total trades across every asset type (not just stock - "how active
 -- a trader is this person overall" is a different question from the stock-specific view
--- above), plus stock-only totals (net worth, buy/sell counts, distinct tickers currently
--- held). stock_net_worth is NULL (not 0) when every held position lacks a cost basis, and
--- also NULL when the legislator holds no stock at all - distinct_tickers_held (0 vs >0)
--- disambiguates the two.
+-- above), plus stock-only totals. Two distinct scopes among the stock columns, named to
+-- keep them apart after a real mix-up already happened once with this view (see below):
+--   - "held" columns (distinct_tickers_held, total_stock_buy_count, total_stock_sell_count,
+--     stock_net_worth, stock_total_cost_basis, win_count) - scoped to CURRENTLY HELD,
+--     actively-priced positions only, exactly matching politician_ticker_positions.
+--   - "all-time" columns (first/last_stock_trade_date, total_stock_dollar_volume) -
+--     every stock trade ever, held or since exited, delisted or not - a broader question
+--     about lifetime trading activity, not current holdings.
+-- stock_net_worth/gain_pct/win_rate_pct are NULL (not 0) when every held position lacks a
+-- cost basis, and also NULL when the legislator holds no stock at all - distinct_tickers_held
+-- (0 vs >0) disambiguates the two.
 --
 -- Deliberately does NOT query politician_ticker_positions (confirmed via EXPLAIN QUERY
 -- PLAN, not assumed): referencing a view that itself has a GROUP BY from inside another
@@ -193,74 +200,155 @@ WHERE a.net_position_estimate > 0
 -- directly as correlated subqueries (verified: each one uses indexed SEARCHes scoped to
 -- just one legislator, never a full scan) fixes it, at the cost of duplicating that SQL
 -- rather than reusing the other view's definition - a deliberate trade of DRY-ness for a
--- real, measured cost difference, not a stylistic preference.
+-- real, measured cost difference, not a stylistic preference. That duplication already
+-- caused one real bug (distinct_tickers_held silently including delisted tickers the
+-- position view excludes, 64 vs 54 for the same legislator) - fixed, with a regression
+-- test, by requiring an active ticker_prices row on every "held" column consistently.
+--
+-- The derived ratio columns (years_active, gain_pct, win_rate_pct) are computed in an outer
+-- SELECT layer over the raw correlated-subquery values, since a column can't reference a
+-- sibling column's alias within the same SELECT list.
 --
 -- Same drop-and-recreate-on-every-connect() approach as the view above (a view holds no
 -- data, so this is free and keeps the definition always in sync with this file).
 DROP VIEW IF EXISTS politician_totals;
 CREATE VIEW politician_totals AS
 SELECT
-    l.id AS legislator_id, l.first_name, l.last_name, l.chamber,
+    legislator_id, first_name, last_name, chamber,
+    total_trades_all_types, latest_trade_date,
+    first_stock_trade_date, last_stock_trade_date,
+    CASE WHEN first_stock_trade_date IS NOT NULL
+         THEN (julianday(last_stock_trade_date) - julianday(first_stock_trade_date)) / 365.25
+    END AS years_active,
+    total_stock_dollar_volume,
+    distinct_tickers_held, total_stock_buy_count, total_stock_sell_count,
+    stock_net_worth, stock_total_cost_basis,
+    CASE WHEN stock_net_worth IS NOT NULL THEN stock_net_worth - stock_total_cost_basis END AS total_estimated_gain,
+    CASE WHEN stock_total_cost_basis IS NOT NULL AND stock_total_cost_basis != 0
+         THEN (stock_net_worth - stock_total_cost_basis) / stock_total_cost_basis * 100
+    END AS gain_pct,
+    win_count,
+    CASE WHEN distinct_tickers_held > 0
+         THEN CAST(win_count AS REAL) / distinct_tickers_held * 100
+    END AS win_rate_pct
+FROM (
+    SELECT
+        l.id AS legislator_id, l.first_name, l.last_name, l.chamber,
 
-    (SELECT COUNT(*) FROM trades t JOIN filings f ON f.id = t.filing_id
-     WHERE f.legislator_id = l.id) AS total_trades_all_types,
+        (SELECT COUNT(*) FROM trades t JOIN filings f ON f.id = t.filing_id
+         WHERE f.legislator_id = l.id) AS total_trades_all_types,
 
-    (SELECT MAX(t.transaction_date) FROM trades t JOIN filings f ON f.id = t.filing_id
-     WHERE f.legislator_id = l.id) AS latest_trade_date,
+        (SELECT MAX(t.transaction_date) FROM trades t JOIN filings f ON f.id = t.filing_id
+         WHERE f.legislator_id = l.id) AS latest_trade_date,
 
-    -- Each of the next three subqueries requires an active ticker_prices row (matching
-    -- politician_ticker_positions' exact scope) - caught via a real discrepancy (54 vs 64)
-    -- while verifying against production: without this, distinct_tickers_held silently
-    -- counted delisted/unpriced tickers that the position view excludes, giving two "current
-    -- holdings" numbers that disagreed with each other.
-    (SELECT COUNT(*) FROM (
-        SELECT t.ticker,
-            SUM(CASE WHEN t.transaction_type = 'purchase'
-                     THEN (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0
-                     ELSE -(t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 END) AS net_pos
-        FROM trades t JOIN filings f ON f.id = t.filing_id
-        WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
-          AND t.ticker IS NOT NULL AND t.ticker != ''
-          AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
-          AND EXISTS (SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'active')
-        GROUP BY t.ticker HAVING net_pos > 0
-    )) AS distinct_tickers_held,
+        (SELECT MIN(t.transaction_date) FROM trades t JOIN filings f ON f.id = t.filing_id
+         WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+           AND t.ticker IS NOT NULL AND t.ticker != ''
+           AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')) AS first_stock_trade_date,
 
-    (SELECT COALESCE(SUM(CASE WHEN t.transaction_type = 'purchase' THEN 1 ELSE 0 END), 0)
-     FROM trades t JOIN filings f ON f.id = t.filing_id
-     WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
-       AND t.ticker IS NOT NULL AND t.ticker != ''
-       AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
-       AND EXISTS (SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'active')) AS total_stock_buy_count,
+        (SELECT MAX(t.transaction_date) FROM trades t JOIN filings f ON f.id = t.filing_id
+         WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+           AND t.ticker IS NOT NULL AND t.ticker != ''
+           AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')) AS last_stock_trade_date,
 
-    (SELECT COALESCE(SUM(CASE WHEN t.transaction_type != 'purchase' THEN 1 ELSE 0 END), 0)
-     FROM trades t JOIN filings f ON f.id = t.filing_id
-     WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
-       AND t.ticker IS NOT NULL AND t.ticker != ''
-       AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
-       AND EXISTS (SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'active')) AS total_stock_sell_count,
+        (SELECT COALESCE(SUM((t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0), 0)
+         FROM trades t JOIN filings f ON f.id = t.filing_id
+         WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+           AND t.ticker IS NOT NULL AND t.ticker != ''
+           AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')) AS total_stock_dollar_volume,
 
-    (SELECT SUM(pos.net_pos * tp.current_price / pos.avg_cost) FROM (
-        SELECT s.ticker,
-            SUM(CASE WHEN s.transaction_type = 'purchase' THEN s.amount_mid ELSE -s.amount_mid END) AS net_pos,
-            SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
-                     THEN s.price_at_transaction * s.amount_mid ELSE 0 END)
-              / NULLIF(SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
-                           THEN s.amount_mid ELSE 0 END), 0) AS avg_cost
-        FROM (
-            SELECT t.ticker, t.transaction_type, t.price_at_transaction,
-                (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 AS amount_mid
+        -- Each of the next six subqueries requires an active ticker_prices row (matching
+        -- politician_ticker_positions' exact "held" scope) - see the header comment above.
+        (SELECT COUNT(*) FROM (
+            SELECT t.ticker,
+                SUM(CASE WHEN t.transaction_type = 'purchase'
+                         THEN (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0
+                         ELSE -(t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 END) AS net_pos
             FROM trades t JOIN filings f ON f.id = t.filing_id
             WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
               AND t.ticker IS NOT NULL AND t.ticker != ''
               AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
-        ) s
-        GROUP BY s.ticker
-    ) pos
-    JOIN ticker_prices tp ON tp.ticker = pos.ticker
-    WHERE pos.net_pos > 0 AND pos.avg_cost IS NOT NULL AND tp.price_status = 'active') AS stock_net_worth
+              AND EXISTS (SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'active')
+            GROUP BY t.ticker HAVING net_pos > 0
+        )) AS distinct_tickers_held,
 
-FROM legislators l;
+        (SELECT COALESCE(SUM(CASE WHEN t.transaction_type = 'purchase' THEN 1 ELSE 0 END), 0)
+         FROM trades t JOIN filings f ON f.id = t.filing_id
+         WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+           AND t.ticker IS NOT NULL AND t.ticker != ''
+           AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+           AND EXISTS (SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'active')) AS total_stock_buy_count,
+
+        (SELECT COALESCE(SUM(CASE WHEN t.transaction_type != 'purchase' THEN 1 ELSE 0 END), 0)
+         FROM trades t JOIN filings f ON f.id = t.filing_id
+         WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+           AND t.ticker IS NOT NULL AND t.ticker != ''
+           AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+           AND EXISTS (SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'active')) AS total_stock_sell_count,
+
+        (SELECT SUM(pos.net_pos * tp.current_price / pos.avg_cost) FROM (
+            SELECT s.ticker,
+                SUM(CASE WHEN s.transaction_type = 'purchase' THEN s.amount_mid ELSE -s.amount_mid END) AS net_pos,
+                SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
+                         THEN s.price_at_transaction * s.amount_mid ELSE 0 END)
+                  / NULLIF(SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
+                               THEN s.amount_mid ELSE 0 END), 0) AS avg_cost
+            FROM (
+                SELECT t.ticker, t.transaction_type, t.price_at_transaction,
+                    (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 AS amount_mid
+                FROM trades t JOIN filings f ON f.id = t.filing_id
+                WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+                  AND t.ticker IS NOT NULL AND t.ticker != ''
+                  AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+            ) s
+            GROUP BY s.ticker
+        ) pos
+        JOIN ticker_prices tp ON tp.ticker = pos.ticker
+        WHERE pos.net_pos > 0 AND pos.avg_cost IS NOT NULL AND tp.price_status = 'active') AS stock_net_worth,
+
+        (SELECT SUM(pos.net_pos) FROM (
+            SELECT s.ticker,
+                SUM(CASE WHEN s.transaction_type = 'purchase' THEN s.amount_mid ELSE -s.amount_mid END) AS net_pos,
+                SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
+                         THEN s.price_at_transaction * s.amount_mid ELSE 0 END)
+                  / NULLIF(SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
+                               THEN s.amount_mid ELSE 0 END), 0) AS avg_cost
+            FROM (
+                SELECT t.ticker, t.transaction_type, t.price_at_transaction,
+                    (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 AS amount_mid
+                FROM trades t JOIN filings f ON f.id = t.filing_id
+                WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+                  AND t.ticker IS NOT NULL AND t.ticker != ''
+                  AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+            ) s
+            GROUP BY s.ticker
+        ) pos
+        JOIN ticker_prices tp ON tp.ticker = pos.ticker
+        WHERE pos.net_pos > 0 AND pos.avg_cost IS NOT NULL AND tp.price_status = 'active') AS stock_total_cost_basis,
+
+        (SELECT COUNT(*) FROM (
+            SELECT s.ticker,
+                SUM(CASE WHEN s.transaction_type = 'purchase' THEN s.amount_mid ELSE -s.amount_mid END) AS net_pos,
+                SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
+                         THEN s.price_at_transaction * s.amount_mid ELSE 0 END)
+                  / NULLIF(SUM(CASE WHEN s.transaction_type = 'purchase' AND s.price_at_transaction IS NOT NULL
+                               THEN s.amount_mid ELSE 0 END), 0) AS avg_cost
+            FROM (
+                SELECT t.ticker, t.transaction_type, t.price_at_transaction,
+                    (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 AS amount_mid
+                FROM trades t JOIN filings f ON f.id = t.filing_id
+                WHERE f.legislator_id = l.id AND t.asset_type IN ('ST', 'Stock')
+                  AND t.ticker IS NOT NULL AND t.ticker != ''
+                  AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+            ) s
+            GROUP BY s.ticker
+        ) pos
+        JOIN ticker_prices tp ON tp.ticker = pos.ticker
+        WHERE pos.net_pos > 0 AND pos.avg_cost IS NOT NULL AND tp.price_status = 'active'
+          AND tp.current_price > pos.avg_cost) AS win_count
+
+    FROM legislators l
+);
 
 -- One row per scraper invocation, for observability once ingestion runs on a schedule.
 CREATE TABLE IF NOT EXISTS ingestion_runs (

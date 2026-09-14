@@ -75,6 +75,57 @@ def test_stock_totals_match_position_view(conn):
     # stock_net_worth is current market value, not gain: AAPL 2000 * (300/150) = 4000,
     # MSFT 1000 * (100/50) = 2000 -> 6000 total
     assert row["stock_net_worth"] == 6000.0
+    # cost basis: AAPL 2000 + MSFT 1000 = 3000; gain = 6000 - 3000 = 3000; gain_pct = 100%
+    assert row["stock_total_cost_basis"] == 3000.0
+    assert row["total_estimated_gain"] == 3000.0
+    assert row["gain_pct"] == 100.0
+    # both positions are in profit (300 > 150, 100 > 50)
+    assert row["win_count"] == 2
+    assert row["win_rate_pct"] == 100.0
+    # all-time dollar volume across the 3 buys, regardless of current holdings
+    assert row["total_stock_dollar_volume"] == 3000.0
+
+
+def test_win_rate_reflects_a_mix_of_winners_and_losers(conn):
+    leg_id, _ = _insert_trade(conn, ("Alan", "Armstrong"), "WINNER", price_at_transaction=100.0)
+    _insert_trade(conn, ("Alan", "Armstrong"), "LOSER", price_at_transaction=100.0)
+    _set_price(conn, "WINNER", 200.0)  # up
+    _set_price(conn, "LOSER", 50.0)    # down
+
+    row = _totals(conn, leg_id)
+    assert row["distinct_tickers_held"] == 2
+    assert row["win_count"] == 1
+    assert row["win_rate_pct"] == 50.0
+    assert row["gain_pct"] == 25.0  # net_worth (1000*2 + 1000*0.5=2500) vs cost basis 2000 -> +25%
+
+
+def test_stock_trade_dates_and_years_active(conn):
+    leg_id, _ = _insert_trade(conn, ("Alan", "Armstrong"), "AAPL",
+                              transaction_date="2020-01-01", price_at_transaction=100.0)
+    _insert_trade(conn, ("Alan", "Armstrong"), "AAPL",
+                  transaction_date="2022-01-01", price_at_transaction=150.0)
+    _set_price(conn, "AAPL", 200.0)
+
+    row = _totals(conn, leg_id)
+    assert row["first_stock_trade_date"] == "2020-01-01"
+    assert row["last_stock_trade_date"] == "2022-01-01"
+    assert 1.99 < row["years_active"] < 2.01  # ~2 years apart, allowing for the 365.25 divisor
+
+
+def test_dollar_volume_includes_exited_and_delisted_tickers_unlike_held_columns(conn):
+    """total_stock_dollar_volume is a lifetime-activity metric, deliberately broader than
+    distinct_tickers_held/stock_net_worth - it must still count a position that was fully
+    sold or whose ticker later delisted, unlike the "held" columns."""
+    leg_id, _ = _insert_trade(conn, ("Alan", "Armstrong"), "GONE", price_at_transaction=100.0,
+                              amount_low=5000, amount_high=5000)
+    _insert_trade(conn, ("Alan", "Armstrong"), "GONE", transaction_type="sale_full",
+                  amount_low=5000, amount_high=5000, price_at_transaction=None)
+    # No ticker_prices row at all for GONE - excluded from every "held" column.
+
+    row = _totals(conn, leg_id)
+    assert row["distinct_tickers_held"] == 0
+    assert row["stock_net_worth"] is None
+    assert row["total_stock_dollar_volume"] == 10000.0  # both the buy and the sell still count
 
 
 def test_legislator_with_no_trades_still_appears(conn):
