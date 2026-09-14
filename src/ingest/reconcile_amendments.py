@@ -221,16 +221,21 @@ def reconcile_house_amendments(conn):
         """
     ).fetchall()
 
+    # Bulk-fetched once instead of one query per amended trade - see PLAN.md.
+    already_resolved_targets = {
+        row["superseded_by_trade_id"]
+        for row in conn.execute(
+            "SELECT superseded_by_trade_id FROM trades WHERE superseded_by_trade_id IS NOT NULL"
+        ).fetchall()
+    }
+
     summary = {"resolved": 0, "ambiguous": 0, "no_match": 0, "skipped_already_processed": 0}
 
     for amended in amended_trades:
         if amended["reconciliation_note"] is not None:
             summary["skipped_already_processed"] += 1
             continue
-        already_resolved = conn.execute(
-            "SELECT 1 FROM trades WHERE superseded_by_trade_id = ?", (amended["id"],)
-        ).fetchone()
-        if already_resolved:
+        if amended["id"] in already_resolved_targets:
             summary["skipped_already_processed"] += 1
             continue
 

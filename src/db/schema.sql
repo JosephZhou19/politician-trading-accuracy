@@ -102,6 +102,9 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_filing_id ON trades (filing_id);
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades (ticker);
 CREATE INDEX IF NOT EXISTS idx_trades_transaction_date ON trades (transaction_date);
+-- Partial - most rows are NULL here. reconcile_house_amendments queries this; see PLAN.md.
+CREATE INDEX IF NOT EXISTS idx_trades_superseded_by_trade_id
+    ON trades (superseded_by_trade_id) WHERE superseded_by_trade_id IS NOT NULL;
 
 -- One row per distinct ticker - current price is a shared, mutable fact about the stock,
 -- not the trade, so it's stored once here and joined against every trade of that ticker
