@@ -678,18 +678,21 @@ def backfill_delisted_status(conn: sqlite3.Connection) -> int:
     analysis. zero_streak is set to the threshold for consistency, but last_checked_at
     stays NULL since no Finnhub call happened - this comes from the historical backfill's
     absence of data, a different source. Returns the count newly labeled."""
+    # Same fix as get_tickers_due_for_price_check: compute has-any-price per ticker in one
+    # grouped pass instead of a correlated EXISTS re-evaluated per trade row.
     rows = conn.execute(
         """
-        SELECT DISTINCT t.ticker FROM trades t
-        WHERE t.ticker IS NOT NULL AND t.ticker != ''
-          AND NOT EXISTS (
-              SELECT 1 FROM trades t2 WHERE t2.ticker = t.ticker AND (
-                  t2.price_at_transaction IS NOT NULL OR t2.price_at_notification IS NOT NULL
-                  OR t2.price_30d IS NOT NULL OR t2.price_90d IS NOT NULL
-                  OR t2.price_180d IS NOT NULL OR t2.price_365d IS NOT NULL
-              )
-          )
-          AND t.ticker NOT IN (SELECT ticker FROM ticker_prices)
+        WITH ticker_has_price AS (
+            SELECT ticker,
+                   MAX(price_at_transaction IS NOT NULL OR price_at_notification IS NOT NULL
+                       OR price_30d IS NOT NULL OR price_90d IS NOT NULL
+                       OR price_180d IS NOT NULL OR price_365d IS NOT NULL) AS has_price
+            FROM trades
+            WHERE ticker IS NOT NULL AND ticker != ''
+            GROUP BY ticker
+        )
+        SELECT ticker FROM ticker_has_price
+        WHERE has_price = 0 AND ticker NOT IN (SELECT ticker FROM ticker_prices)
         """
     ).fetchall()
     tickers = [row["ticker"] for row in rows]
