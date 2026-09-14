@@ -350,6 +350,72 @@ FROM (
     FROM legislators l
 );
 
+-- Per (legislator, year) historical activity - a real calendar year of trades, not a
+-- rolling window. All-time/historical scope throughout (no ticker_prices join, no "still
+-- actively priced today" requirement) - a legislator's real 2015 trade counts toward 2015
+-- even if that ticker has since delisted; restricting to still-live tickers would erase
+-- real history for no good reason. No cross-view reference either, so none of the
+-- predicate-pushdown caution that shaped politician_totals applies here - this is a
+-- single, direct GROUP BY over trades/filings/legislators, the same shape already proven
+-- (in politician_ticker_positions) to push a legislator_id filter down to indexed lookups.
+--
+-- "Yearly gain" is deliberately NOT current unrealized gain split by year - a 2015 trade
+-- evaluated at today's price has had 11 years to grow, an trade from last year has had
+-- one, so comparing them that way would mostly measure elapsed time, not trading skill.
+-- True realized gain needs lot-matching (buys to the sells that closed them), which is its
+-- own separate, harder project, deliberately not attempted here. Instead this uses each
+-- trade's already-backfilled price_365d column - the real price exactly 365 days after
+-- that specific transaction - giving a fair, fixed-window return comparable across years.
+-- Recent years will show partial or NULL 1yr figures until a full 365 days has actually
+-- elapsed since those trades - expected, not a bug. trades_with_1yr_data is the trust
+-- indicator: a low count means don't read much into that year's return/win-rate figures.
+DROP VIEW IF EXISTS politician_yearly_activity;
+CREATE VIEW politician_yearly_activity AS
+SELECT
+    f.legislator_id,
+    l.first_name, l.last_name, l.chamber,
+    CAST(strftime('%Y', t.transaction_date) AS INTEGER) AS year,
+
+    COUNT(*) AS total_trades_all_types,
+
+    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
+             THEN 1 ELSE 0 END) AS stock_buy_count,
+    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type IN ('sale_full', 'sale_partial')
+             THEN 1 ELSE 0 END) AS stock_sell_count,
+
+    COUNT(DISTINCT CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.ticker IS NOT NULL AND t.ticker != ''
+                        THEN t.ticker END) AS distinct_tickers_traded,
+
+    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type IN ('purchase', 'sale_full', 'sale_partial')
+             THEN (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0 ELSE 0 END) AS total_stock_dollar_volume,
+
+    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
+             AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
+             THEN 1 ELSE 0 END) AS trades_with_1yr_data,
+
+    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
+             AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
+             THEN (t.price_365d - t.price_at_transaction) / t.price_at_transaction
+                  * (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0
+             ELSE 0 END)
+      / NULLIF(SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
+                        AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
+                        THEN (t.amount_low + COALESCE(t.amount_high, t.amount_low)) / 2.0
+                   ELSE 0 END), 0) * 100 AS avg_1yr_return_pct,
+
+    SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
+             AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
+             AND t.price_365d > t.price_at_transaction
+             THEN 1 ELSE 0 END) * 100.0
+      / NULLIF(SUM(CASE WHEN t.asset_type IN ('ST', 'Stock') AND t.transaction_type = 'purchase'
+                        AND t.price_at_transaction IS NOT NULL AND t.price_365d IS NOT NULL
+                   THEN 1 ELSE 0 END), 0) AS win_rate_1yr_pct
+
+FROM trades t
+JOIN filings f ON f.id = t.filing_id
+JOIN legislators l ON l.id = f.legislator_id
+GROUP BY f.legislator_id, year;
+
 -- One row per scraper invocation, for observability once ingestion runs on a schedule.
 CREATE TABLE IF NOT EXISTS ingestion_runs (
     id              INTEGER PRIMARY KEY,
