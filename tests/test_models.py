@@ -471,6 +471,36 @@ def test_turso_reconnects_once_on_stale_stream():
     assert "reconnecting" in mock_logger.warning.call_args[0][0]
 
 
+def test_turso_reconnects_once_on_idle_transaction_rollback():
+    """Regression: a slow run of external API calls (Finnhub) inside one open, uncommitted
+    batch can leave a Turso transaction idle long enough that the server rolls it back -
+    a different error message than the stale-stream case, which crashed a real production
+    run (daily-price-trickle.yml, 2026-09-15) uncaught before this fix."""
+    conn = _make_turso_connection()
+    call_count = {"n": 0}
+
+    def flaky():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: interactive '
+                'transaction was rolled back because the stream was idle for too long; '
+                'retry the transaction", code: "SQLITE_BUSY" }`'
+            )
+        return "ok"
+
+    with patch.object(conn, "_new_conn", return_value="reconnected-conn") as mock_new_conn, \
+            patch.object(models, "logger") as mock_logger:
+        result = conn._with_reconnect(flaky)
+
+    assert result == "ok"
+    assert call_count["n"] == 2
+    mock_new_conn.assert_called_once()
+    assert conn._conn == "reconnected-conn"
+    mock_logger.warning.assert_called_once()
+    assert "reconnecting" in mock_logger.warning.call_args[0][0]
+
+
 def test_turso_reraises_non_stream_errors():
     conn = _make_turso_connection()
 

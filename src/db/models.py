@@ -61,11 +61,18 @@ class _TursoCursor:
         return self._cursor.lastrowid
 
 
+# Substrings of the two known-recoverable Hrana stream failures: the session going stale
+# between queries (e.g. a scraper busy downloading PDFs) and a server-side idle-transaction
+# rollback (e.g. a slow run of external API calls - Finnhub - sitting inside one open,
+# uncommitted batch for too long). Both are transient and safe to retry once on a fresh
+# connection; anything else re-raises rather than silently retrying an unknown failure.
+_RECOVERABLE_STREAM_ERRORS = ("stream not found", "was idle for too long")
+
+
 class _TursoConnection:
     """Wraps a libsql connection with sqlite3.Row-shaped results, and reconnects once on a
-    Hrana "stream not found" error - Turso's remote session can go stale if enough wall-clock
-    time passes between queries (e.g. a scraper busy downloading PDFs), and the connection
-    object doesn't recover from that on its own."""
+    recoverable Hrana stream error - Turso's remote session can go stale or roll back an
+    idle transaction, and the connection object doesn't recover from that on its own."""
 
     def __init__(self, url, token):
         self._url = url
@@ -83,11 +90,11 @@ class _TursoConnection:
         try:
             result = call()
         except ValueError as e:
-            if "stream not found" not in str(e):
+            if not any(marker in str(e) for marker in _RECOVERABLE_STREAM_ERRORS):
                 raise
             logger.warning(
-                "Turso stream went stale after %.0fms - reconnecting and retrying",
-                (time.monotonic() - start) * 1000,
+                "Turso stream error after %.0fms - reconnecting and retrying: %s",
+                (time.monotonic() - start) * 1000, str(e)[:200],
             )
             self._conn = self._new_conn()
             result = call()
