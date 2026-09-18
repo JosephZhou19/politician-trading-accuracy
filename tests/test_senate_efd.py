@@ -1,14 +1,30 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from src.db import models
 from src.ingest import senate_efd
-from src.ingest.senate_efd import FILER_TYPE_SENATOR, ingest_ptrs
+from src.ingest.senate_efd import FILER_TYPE_SENATOR, ingest_ptrs, new_session
 
 
 def _search_row(href="/search/view/ptr/aaa-111/", link_text="PTR for 08/27/2026",
                  first="Thomas", last="Carper", date_str="09/02/2026"):
     link_html = f'<a href="{href}">{link_text}</a>'
     return [first, last, "DE", link_html, date_str]
+
+
+def test_new_session_raises_clear_error_when_csrf_field_is_missing():
+    """Regression for run #50 (2026-09-17): efdsearch.senate.gov returning anything other
+    than the expected form (outage, rate-limit/interstitial page, ...) used to blow up as
+    a bare 'NoneType is not subscriptable' TypeError with no indication of what went
+    wrong. Should fail with a message that actually explains the situation instead."""
+    fake_resp = MagicMock(status_code=503, text="<html><body>Service unavailable</body></html>")
+    fake_session = MagicMock()
+    fake_session.get.return_value = fake_resp
+
+    with patch.object(senate_efd.requests, "Session", return_value=fake_session):
+        with pytest.raises(RuntimeError, match="didn't return the expected CSRF form field"):
+            new_session()
 
 
 def test_ingest_ptrs_skips_already_parsed_filing_via_dict_with_no_db_lookup(conn, tmp_path):

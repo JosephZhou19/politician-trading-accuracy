@@ -61,7 +61,15 @@ def new_session():
     session.headers.update({"User-Agent": USER_AGENT})
     resp = session.get(HOME_URL)
     soup = BeautifulSoup(resp.text, "html.parser")
-    token = soup.find("input", {"name": "csrfmiddlewaretoken"})["value"]
+    token_input = soup.find("input", {"name": "csrfmiddlewaretoken"})
+    if token_input is None:
+        raise RuntimeError(
+            f"Senate eFD home page didn't return the expected CSRF form field "
+            f"(status={resp.status_code}) - site may be down, rate-limiting, or "
+            f"showing an interstitial page instead of the search form. "
+            f"Body starts: {resp.text[:200]!r}"
+        )
+    token = token_input["value"]
     session.post(
         HOME_URL,
         data={"csrfmiddlewaretoken": token, "prohibition_agreement": "1"},
