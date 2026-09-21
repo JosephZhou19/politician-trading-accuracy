@@ -4,7 +4,12 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from src.market.prices import TickerHistory, _normalize_ticker, fetch_ticker_history_stockanalysis
+from src.market.prices import (
+    TickerHistory,
+    _normalize_ticker,
+    fetch_ticker_history,
+    fetch_ticker_history_stockanalysis,
+)
 
 
 def _history(dates_and_prices):
@@ -95,6 +100,57 @@ def test_price_all_remaining_days_garbage_returns_none():
 def test_daily_prices_skips_garbage_value():
     h = _history([((2024, 1, 2), 100.0), ((2024, 1, 3), 8e-07)])
     assert h.daily_prices() == [(datetime.date(2024, 1, 2), 100.0)]
+
+
+def test_price_skips_implausibly_huge_garbage_value():
+    """Regression: yfinance's own historical data came back as ~2.9e15-3.6e15 for AEXAY
+    (a real ~$6 stock) - confirmed live against real-world prices, off by 14+ orders of
+    magnitude, not just noisy. Must be skipped like a NaN gap, not returned as a real
+    price. NOTE: the ceiling is deliberately set only to catch astronomical-scale garbage
+    like this - it does NOT catch SUNE/NVVE/REVB/APVO's $1.9M-$7.7M-range garbage (checked
+    directly: all of those are below this ceiling), because any threshold low enough to
+    catch them would risk rejecting BRK.A's real, actively-climbing price within a few
+    years (see the MAX_PLAUSIBLE_PRICE comment). Those need per-ticker DB cleanup, not a
+    threshold."""
+    h = _history([((2023, 2, 1), 2.9e15), ((2023, 2, 2), 6.0)])
+    assert h.price_on_or_after(datetime.date(2023, 2, 1)) == 6.0
+
+
+def test_price_does_not_reject_a_real_ultra_high_price_stock():
+    """A legitimate ultra-high-price stock (BRK.A, confirmed real up to ~$770k, and still
+    growing - the ceiling must stay well clear of its plausible near-future range, not
+    just its price today) must still be returned."""
+    h = _history([((2024, 1, 2), 620000.0)])
+    assert h.price_on_or_after(datetime.date(2024, 1, 2)) == 620000.0
+
+
+def test_price_does_not_reject_brk_a_at_its_confirmed_all_time_high():
+    """Regression: an earlier, lower ceiling (1,000,000) would have been crossed by BRK.A's
+    own confirmed real all-time-high ($803,783 as of 2025-05) within a couple of years at
+    its ~13%/year trend - the ceiling must clear this with real headroom, not just today's
+    price."""
+    h = _history([((2025, 5, 2), 803783.0)])
+    assert h.price_on_or_after(datetime.date(2025, 5, 2)) == 803783.0
+
+
+def test_price_all_remaining_days_huge_garbage_returns_none():
+    h = _history([((2024, 1, 2), 100.0), ((2024, 1, 3), 3.5e15)])
+    assert h.price_on_or_after(datetime.date(2024, 1, 3)) is None
+
+
+def test_daily_prices_skips_huge_garbage_value():
+    h = _history([((2024, 1, 2), 100.0), ((2024, 1, 3), 3.5e15)])
+    assert h.daily_prices() == [(datetime.date(2024, 1, 2), 100.0)]
+
+
+def test_fetch_ticker_history_skips_known_bad_ticker_without_calling_yfinance():
+    """A KNOWN_BAD_TICKERS entry (e.g. PARA, confirmed live to still return garbage) must
+    return None before ever hitting the yfinance API - both to avoid re-storing the same
+    garbage on the next scheduled backfill run, and to not waste the API call."""
+    with patch("src.market.prices.yf.Ticker") as mock_ticker_cls:
+        result = fetch_ticker_history("PARA", datetime.date(2023, 1, 1), datetime.date(2023, 6, 1))
+    assert result is None
+    mock_ticker_cls.assert_not_called()
 
 
 def test_normalize_ticker_converts_period_to_hyphen():

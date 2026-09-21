@@ -52,6 +52,24 @@ class TickerHistory:
     # philosophy as MAX_ROLL_FORWARD_DAYS above.
     MIN_PLAUSIBLE_PRICE = 0.001
 
+    # Same yfinance-garbage-history problem, opposite direction - but NOTE the limits of
+    # this check, confirmed by checking real numbers rather than assuming: it only catches
+    # astronomical-scale garbage (confirmed: AEXAY at ~10^15, also seen negative - already
+    # caught by the floor above). It does NOT catch SUNE ($3.05M-3.4M, a real ~$2-3 stock),
+    # NVVE ($1.8M-3.4M), REVB ($1.97M, identical across 36 different calendar dates - real
+    # prices don't do that), APVO ($7.7M), OCLCF ($90,684), or PARA (up to $98,001) - all
+    # confirmed-bad but too low to threshold on, because BRK.A is a real, actively-traded
+    # stock (8 real correctly-priced trades already in this DB, up to $464,947) whose own
+    # price keeps climbing (all-time-high $803,783 as of 2025-05, ~13%/year over the last 5
+    # years) - any ceiling low enough to catch REVB's $1.97M would leave BRK.A only ~3-4
+    # years before a real price got wrongly rejected too. Set high enough (decades of BRK.A
+    # headroom even under aggressive growth) that it only ever fires on unambiguous,
+    # extreme-magnitude garbage; the $1M-8M-range tickers above need the same manual
+    # per-ticker DB cleanup DAIUF/AOZOF got, not a threshold - this is a backstop against a
+    # NEW astronomical-scale event on a ticker not yet known to be bad, not a fix for any
+    # of the ones already found.
+    MAX_PLAUSIBLE_PRICE = 50_000_000
+
     def price_on_or_after(self, target_date: datetime.date) -> float | None:
         """Open price on target_date, or the next trading day if it falls on a weekend or
         market holiday. Skips past a trading day with no real Open (a halt, data gap, or
@@ -65,7 +83,7 @@ class TickerHistory:
             if (found_date - target_date).days > self.MAX_ROLL_FORWARD_DAYS:
                 return None
             price = self._opens.iloc[idx]
-            if not math.isnan(price) and price >= self.MIN_PLAUSIBLE_PRICE:
+            if not math.isnan(price) and self.MIN_PLAUSIBLE_PRICE <= price <= self.MAX_PLAUSIBLE_PRICE:
                 return float(price)
             idx += 1
         return None
@@ -77,8 +95,37 @@ class TickerHistory:
         return [
             (date, float(price))
             for date, price in self._opens.items()
-            if not math.isnan(price) and price >= self.MIN_PLAUSIBLE_PRICE
+            if not math.isnan(price) and self.MIN_PLAUSIBLE_PRICE <= price <= self.MAX_PLAUSIBLE_PRICE
         ]
+
+
+# Tickers where yfinance's own historical data is confirmed garbage (wrong by 100x to
+# 10^15x against real-world prices, verified live - not a MIN/MAX_PLAUSIBLE_PRICE gap,
+# since several of these sit in a range indistinguishable from a real ultra-high-price
+# stock like BRK.A without a threshold that would eventually reject BRK.A itself; see
+# MAX_PLAUSIBLE_PRICE's comment). Checked live and confirmed still broken as of 2026-09-20.
+# These are real, actively-traded companies - do NOT add them to ticker_prices as
+# 'delisted', which would also (wrongly) stop tracking their real current price via
+# Finnhub; this list only ever affects the yfinance historical-price path. Skipped before
+# the API call entirely (saves the request, not just the bad data). No automatic recheck -
+# if yfinance ever fixes its own historical data for one of these, the only cost of not
+# noticing is staying unpriced, never a wrong price; revisit manually if that matters.
+KNOWN_BAD_TICKERS = frozenset({
+    "DAIUF",   # Daifuku Co Ltd - confirmed real ~$35; yfinance returned ~8e-07 to ~4e-05
+    "AOZOF",   # Aozora Bank - confirmed real ~$14; yfinance returned ~9e-25 to ~3e-20
+    "SUNE",    # SUNation Energy - confirmed real ~$2-3; yfinance returned ~$2.4M-3.4M
+    "NVVE",    # Nuvve Holding Corp - confirmed real ~$1-12; yfinance returned ~$1.8M-3.4M
+    "APVO",    # Aptevo Therapeutics - confirmed real ~$1-3; yfinance returned ~$7.7M
+    "AEXAY",   # Atos Group (ADR) - yfinance returned ~-3e17 to ~3.6e15, both impossible
+    "REVB",    # Revelation Biosciences - confirmed real ~$0.9; yfinance returned a flat
+               # $1,965,600 across 36 different calendar dates - not real market data
+    "OCLCF",   # Oracle Corporation Japan - yfinance returned $90,684 and -$230,171/-$11,468
+    "JGCCF",   # JGC Holdings - confirmed real ~$15; yfinance returned -$142.05 (negative)
+    "KOSCF",   # KOSE Holdings - confirmed real ~$33; yfinance returned ~-2e-05 (negative)
+    "MLPN",    # Credit Suisse X-Links Cushing MLP Infrastructure ETN - yfinance returned
+               # an exact 0.0 for an actively-listed security in 2013
+    "PARA",    # Paramount Global - confirmed real ~$10-24; yfinance returned $1,479-$98,001
+})
 
 
 def fetch_ticker_history(
@@ -86,14 +133,17 @@ def fetch_ticker_history(
 ) -> TickerHistory | None:
     """Fetches one ticker's daily Open price for [start_date, end_date]. Returns None if
     the ticker has no data at all in that range (delisted, renamed - e.g. Yahoo serves no
-    history at all under the dead "FB" symbol, only "META" - or a disclosure typo) rather
-    than raising; a caller should treat that as "can't price this trade", not a crash.
+    history at all under the dead "FB" symbol, only "META" - or a disclosure typo), or if
+    it's in KNOWN_BAD_TICKERS (yfinance has data, but it's confirmed garbage) - either way
+    a caller should treat this as "can't price this trade", not a crash.
 
     end_date is padded by a few days past yfinance's exclusive end-of-range so the exact
     end_date requested is actually included, and so a target that lands on end_date itself
     can still roll forward to its next trading day.
     """
     normalized = _normalize_ticker(ticker)
+    if normalized in KNOWN_BAD_TICKERS:
+        return None
     padded_end = end_date + datetime.timedelta(days=5)
     history = yf.Ticker(normalized).history(start=start_date, end=padded_end)
     if history.empty:
