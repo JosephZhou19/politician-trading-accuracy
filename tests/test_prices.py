@@ -71,6 +71,32 @@ def test_price_all_remaining_days_nan_returns_none():
     assert h.price_on_or_after(datetime.date(2024, 1, 3)) is None
 
 
+def test_price_skips_implausibly_tiny_garbage_value():
+    """Regression: yfinance's own historical Open data came back as 8e-07 for DAIUF
+    (Daifuku Co Ltd, a real ~$35 stock) on real 2019 dates, and 9.8e-25 for AOZOF (a real
+    ~$14 stock) - not noisy data, garbage many orders of magnitude off. Must be skipped
+    like a NaN gap, not returned as a real price."""
+    h = _history([((2019, 11, 19), 8.513364377904509e-07), ((2019, 11, 20), 25.0)])
+    assert h.price_on_or_after(datetime.date(2019, 11, 19)) == 25.0
+
+
+def test_price_does_not_reject_a_real_penny_stock():
+    """A legitimate penny stock (confirmed real: GGSM at $0.0024) must still be returned -
+    the garbage-value floor sits far below any real traded price, not just below $1."""
+    h = _history([((2024, 1, 2), 0.0024)])
+    assert h.price_on_or_after(datetime.date(2024, 1, 2)) == 0.0024
+
+
+def test_price_all_remaining_days_garbage_returns_none():
+    h = _history([((2024, 1, 2), 100.0), ((2024, 1, 3), 9.8e-25)])
+    assert h.price_on_or_after(datetime.date(2024, 1, 3)) is None
+
+
+def test_daily_prices_skips_garbage_value():
+    h = _history([((2024, 1, 2), 100.0), ((2024, 1, 3), 8e-07)])
+    assert h.daily_prices() == [(datetime.date(2024, 1, 2), 100.0)]
+
+
 def test_normalize_ticker_converts_period_to_hyphen():
     """Yahoo requires a hyphen for share classes (BRK-B); disclosures often use a period."""
     assert _normalize_ticker("BRK.B") == "BRK-B"

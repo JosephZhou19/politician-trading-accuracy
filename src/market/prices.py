@@ -43,30 +43,41 @@ class TickerHistory:
     # price as if it were Monsanto's). Reject rather than silently return a wrong match.
     MAX_ROLL_FORWARD_DAYS = 10
 
+    # yfinance's own historical Open data can be flat-out garbage for thinly-traded OTC
+    # ordinary-share tickers, confirmed for real: DAIUF (Daifuku Co Ltd, currently ~$35)
+    # came back as 8e-07 for 2019 dates, AOZOF (Aozora Bank, currently ~$14) as 9.8e-25 -
+    # both off by 7-24 orders of magnitude, not just noisy. A legitimate penny stock (GGSM,
+    # confirmed real at $0.0024) stays far above this floor, so it's a safe cutoff, not
+    # just a round number. Same "reject rather than silently return a wrong match"
+    # philosophy as MAX_ROLL_FORWARD_DAYS above.
+    MIN_PLAUSIBLE_PRICE = 0.001
+
     def price_on_or_after(self, target_date: datetime.date) -> float | None:
         """Open price on target_date, or the next trading day if it falls on a weekend or
-        market holiday. Skips past a trading day with no real Open (a halt or data gap -
-        confirmed this happens on real data) rather than returning NaN. None if there's no
-        valid price within MAX_ROLL_FORWARD_DAYS of target_date - either the history ends
-        before target_date, or (a recycled ticker symbol) it doesn't cover that era at all."""
+        market holiday. Skips past a trading day with no real Open (a halt, data gap, or
+        implausible garbage value - all confirmed to happen on real data) rather than
+        returning it as-is. None if there's no valid price within MAX_ROLL_FORWARD_DAYS of
+        target_date - either the history ends before target_date, or (a recycled ticker
+        symbol) it doesn't cover that era at all."""
         idx = self._opens.index.searchsorted(target_date)
         while idx < len(self._opens):
             found_date = self._opens.index[idx]
             if (found_date - target_date).days > self.MAX_ROLL_FORWARD_DAYS:
                 return None
             price = self._opens.iloc[idx]
-            if not math.isnan(price):
+            if not math.isnan(price) and price >= self.MIN_PLAUSIBLE_PRICE:
                 return float(price)
             idx += 1
         return None
 
     def daily_prices(self) -> list[tuple[datetime.date, float]]:
-        """Every (date, price) pair with a real Open - for bulk-loading a lookup table
-        (e.g. benchmark_prices) rather than the point-lookup use price_on_or_after serves."""
+        """Every (date, price) pair with a real, plausible Open - for bulk-loading a lookup
+        table (e.g. benchmark_prices) rather than the point-lookup use price_on_or_after
+        serves."""
         return [
             (date, float(price))
             for date, price in self._opens.items()
-            if not math.isnan(price)
+            if not math.isnan(price) and price >= self.MIN_PLAUSIBLE_PRICE
         ]
 
 
