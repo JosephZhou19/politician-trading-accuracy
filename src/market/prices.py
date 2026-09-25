@@ -110,15 +110,17 @@ class TickerHistory:
 # the API call entirely (saves the request, not just the bad data). No automatic recheck -
 # if yfinance ever fixes its own historical data for one of these, the only cost of not
 # noticing is staying unpriced, never a wrong price; revisit manually if that matters.
+#
+# NOTE (2026-09-25): SUNE, NVVE, APVO and REVB were removed from this list after directly
+# checking their split histories - each has done repeated real reverse stock splits, and
+# yfinance's own history is just correctly split-adjusting old prices, not garbage. Their
+# affected trades' price columns were already NULL (an earlier, overly-broad cleanup pass
+# had cleared them while they still sat in this list) - the next backfill run will price
+# them normally now that the ticker isn't blocked.
 KNOWN_BAD_TICKERS = frozenset({
     "DAIUF",   # Daifuku Co Ltd - confirmed real ~$35; yfinance returned ~8e-07 to ~4e-05
     "AOZOF",   # Aozora Bank - confirmed real ~$14; yfinance returned ~9e-25 to ~3e-20
-    "SUNE",    # SUNation Energy - confirmed real ~$2-3; yfinance returned ~$2.4M-3.4M
-    "NVVE",    # Nuvve Holding Corp - confirmed real ~$1-12; yfinance returned ~$1.8M-3.4M
-    "APVO",    # Aptevo Therapeutics - confirmed real ~$1-3; yfinance returned ~$7.7M
     "AEXAY",   # Atos Group (ADR) - yfinance returned ~-3e17 to ~3.6e15, both impossible
-    "REVB",    # Revelation Biosciences - confirmed real ~$0.9; yfinance returned a flat
-               # $1,965,600 across 36 different calendar dates - not real market data
     "OCLCF",   # Oracle Corporation Japan - yfinance returned $90,684 and -$230,171/-$11,468
     "JGCCF",   # JGC Holdings - confirmed real ~$15; yfinance returned -$142.05 (negative)
     "KOSCF",   # KOSE Holdings - confirmed real ~$33; yfinance returned ~-2e-05 (negative)
