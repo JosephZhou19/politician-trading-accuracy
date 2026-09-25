@@ -34,22 +34,77 @@ STOCKANALYSIS_NOTE = (
 )
 
 
+def _all_target_dates(trade):
+    """Maps every price column to the date it corresponds to, regardless of whether that
+    column is already set - unlike _target_dates below, which only covers still-unset
+    columns. Used by _rebased_prices to recompute a trade's already-stored prices against a
+    freshly-downloaded history, not just fill in what's missing."""
+    transaction_date = datetime.date.fromisoformat(trade.transaction_date)
+    dates = {
+        "price_at_transaction": transaction_date,
+        "price_at_notification": datetime.date.fromisoformat(trade.notification_date),
+    }
+    for column, days in models.HORIZON_COLUMNS:
+        dates[column] = transaction_date + datetime.timedelta(days=days)
+    return dates
+
+
 def _target_dates(trade, today):
     """Maps each of a trade's still-unset price columns to the date it needs, skipping any
     horizon that hasn't arrived yet."""
-    transaction_date = datetime.date.fromisoformat(trade.transaction_date)
+    all_dates = _all_target_dates(trade)
     targets = {}
     if trade.price_at_transaction is None:
-        targets["price_at_transaction"] = transaction_date
+        targets["price_at_transaction"] = all_dates["price_at_transaction"]
     if trade.price_at_notification is None:
-        targets["price_at_notification"] = datetime.date.fromisoformat(trade.notification_date)
-    for column, days in models.HORIZON_COLUMNS:
+        targets["price_at_notification"] = all_dates["price_at_notification"]
+    for column, _days in models.HORIZON_COLUMNS:
         if getattr(trade, column) is not None:
             continue
-        horizon_date = transaction_date + datetime.timedelta(days=days)
-        if horizon_date <= today:
-            targets[column] = horizon_date
+        if all_dates[column] <= today:
+            targets[column] = all_dates[column]
     return targets
+
+
+# yfinance retroactively rewrites a ticker's ENTIRE history when a stock splits - every
+# price before the split date gets divided by the split ratio. Confirmed this can happen
+# BETWEEN two backfill runs on the very same trade: price_at_transaction gets stored on one
+# run, then a real split happens before a later horizon (e.g. price_365d) arrives, so the
+# next run's freshly-downloaded history no longer agrees with the price this trade already
+# has stored - one column ends up on the pre-split basis, another on the post-split basis,
+# producing a fake multi-x gain/loss with no real market cause. Not yet observed in this DB
+# (comparing 315k stored prices against a fresh download in 2026-09 found only 14 values off
+# by more than this, none from a split - the trickle job hasn't run long enough for one to
+# fall between two fetches) - this guards against it once enough time passes.
+REBASE_RATIO_THRESHOLD = 1.5
+
+
+def _rebased_prices(trade, history):
+    """If this trade's already-stored price_at_transaction is off by more than
+    REBASE_RATIO_THRESHOLD (in either direction) from what the freshly-downloaded history
+    now says for that same date, a split has changed the history's adjustment basis since
+    that price was stored. Returns every one of this trade's already-set price columns
+    recomputed from the fresh history (a column the fresh history can't price is left out,
+    not zeroed), so the whole trade ends up back on one consistent basis. Returns {} if no
+    rebase is needed."""
+    if trade.price_at_transaction is None:
+        return {}
+    transaction_date = datetime.date.fromisoformat(trade.transaction_date)
+    fresh_price = history.price_on_or_after(transaction_date)
+    if fresh_price is None:
+        return {}
+    ratio = fresh_price / trade.price_at_transaction
+    if 1 / REBASE_RATIO_THRESHOLD <= ratio <= REBASE_RATIO_THRESHOLD:
+        return {}
+    all_dates = _all_target_dates(trade)
+    rebased = {}
+    for column in models.PRICE_COLUMNS:
+        if getattr(trade, column) is None:
+            continue
+        price = history.price_on_or_after(all_dates[column])
+        if price is not None:
+            rebased[column] = price
+    return rebased
 
 
 def backfill(conn, ticker_limit=None, use_stockanalysis_fallback=False):
@@ -64,7 +119,7 @@ def backfill(conn, ticker_limit=None, use_stockanalysis_fallback=False):
 
     summary = {
         "tickers": len(by_ticker), "tickers_no_data": 0, "tickers_via_fallback": 0,
-        "trades_touched": 0, "prices_set": 0,
+        "trades_touched": 0, "prices_set": 0, "trades_rebased": 0,
     }
     print(f"{total_trades} trade(s) across {len(by_ticker)} ticker(s) need at least one price.")
 
@@ -90,7 +145,13 @@ def backfill(conn, ticker_limit=None, use_stockanalysis_fallback=False):
 
         any_touched = False
         for trade in ticker_trades:
-            prices = {}
+            prices = _rebased_prices(trade, history)
+            if prices:
+                print(f"{ticker}: trade {trade.id} rebased after an apparent stock split "
+                      f"(stored price_at_transaction {trade.price_at_transaction} vs fresh "
+                      f"{prices['price_at_transaction']}) - rewriting {len(prices)} "
+                      f"already-set price column(s).")
+                summary["trades_rebased"] += 1
             for column, target_date in _target_dates(trade, today).items():
                 price = history.price_on_or_after(target_date)
                 if price is not None:

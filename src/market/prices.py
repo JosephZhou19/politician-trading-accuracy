@@ -133,9 +133,10 @@ def fetch_ticker_history(
 ) -> TickerHistory | None:
     """Fetches one ticker's daily Open price for [start_date, end_date]. Returns None if
     the ticker has no data at all in that range (delisted, renamed - e.g. Yahoo serves no
-    history at all under the dead "FB" symbol, only "META" - or a disclosure typo), or if
-    it's in KNOWN_BAD_TICKERS (yfinance has data, but it's confirmed garbage) - either way
-    a caller should treat this as "can't price this trade", not a crash.
+    history at all under the dead "FB" symbol, only "META" - or a disclosure typo), it's in
+    KNOWN_BAD_TICKERS (yfinance has data, but it's confirmed garbage), or its downloaded
+    history contains any day at or below $0 (see the comment below) - either way a caller
+    should treat this as "can't price this trade", not a crash.
 
     end_date is padded by a few days past yfinance's exclusive end-of-range so the exact
     end_date requested is actually included, and so a target that lands on end_date itself
@@ -150,6 +151,18 @@ def fetch_ticker_history(
         return None
     opens = history["Open"]
     opens.index = opens.index.date
+    # A single implausible value gets skipped in place by MIN/MAX_PLAUSIBLE_PRICE, but a
+    # ticker whose history contains ANY day at or below $0 is a different, worse signal -
+    # confirmed live (2026-09) against 3,011 real tickers already in this DB: 6 of the 12
+    # known-bad tickers (DAIUF, AOZOF, AEXAY, OCLCF, JGCCF, KOSCF) have hundreds to
+    # thousands of zero/negative days apiece, and zero of the 3,011 real tickers have even
+    # one - except 2 legitimate money-market funds whose entire "history" is a single $0
+    # day, which correctly SHOULD be rejected (they have no real daily price to give). A
+    # real stock's Open is never $0 or negative even on its worst day, so this is a safe
+    # whole-ticker reject, not a per-day skip - it also catches the next OTC ticker in this
+    # class before it needs to be hand-added to KNOWN_BAD_TICKERS.
+    if (opens <= 0).any():
+        return None
     return TickerHistory(ticker, opens)
 
 

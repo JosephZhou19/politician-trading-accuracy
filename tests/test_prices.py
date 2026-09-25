@@ -143,6 +143,45 @@ def test_daily_prices_skips_huge_garbage_value():
     assert h.daily_prices() == [(datetime.date(2024, 1, 2), 100.0)]
 
 
+def _mock_yf_history(dates_and_opens):
+    df = pd.DataFrame(
+        {"Open": [p for _, p in dates_and_opens]},
+        index=pd.DatetimeIndex([datetime.datetime(*d) for d, _ in dates_and_opens]),
+    )
+    return df
+
+
+def test_fetch_ticker_history_rejects_ticker_with_any_non_positive_day():
+    """Regression: DAIUF, AOZOF, AEXAY, OCLCF, JGCCF and KOSCF each have hundreds to
+    thousands of zero/negative Open days somewhere in their yfinance history, while a sweep
+    of 3,011 real tickers already in this DB found none with even one (aside from 2
+    legitimate money-market funds whose entire history IS a single $0 day, which should be
+    rejected). A real stock's Open is never $0 or negative, so any such day invalidates the
+    whole downloaded history, not just that one day."""
+    df = _mock_yf_history([((2019, 11, 19), 25.0), ((2019, 11, 20), -0.5), ((2019, 11, 21), 26.0)])
+    with patch("src.market.prices.yf.Ticker") as mock_ticker_cls:
+        mock_ticker_cls.return_value.history.return_value = df
+        result = fetch_ticker_history("BADCO", datetime.date(2019, 11, 1), datetime.date(2019, 12, 1))
+    assert result is None
+
+
+def test_fetch_ticker_history_rejects_ticker_with_a_zero_day():
+    df = _mock_yf_history([((2020, 1, 2), 0.0)])
+    with patch("src.market.prices.yf.Ticker") as mock_ticker_cls:
+        mock_ticker_cls.return_value.history.return_value = df
+        result = fetch_ticker_history("MONEYFUND", datetime.date(2020, 1, 1), datetime.date(2020, 2, 1))
+    assert result is None
+
+
+def test_fetch_ticker_history_accepts_ticker_with_all_positive_days():
+    df = _mock_yf_history([((2020, 1, 2), 100.0), ((2020, 1, 3), 101.0)])
+    with patch("src.market.prices.yf.Ticker") as mock_ticker_cls:
+        mock_ticker_cls.return_value.history.return_value = df
+        result = fetch_ticker_history("AAPL", datetime.date(2020, 1, 1), datetime.date(2020, 2, 1))
+    assert result is not None
+    assert result.price_on_or_after(datetime.date(2020, 1, 2)) == 100.0
+
+
 def test_fetch_ticker_history_skips_known_bad_ticker_without_calling_yfinance():
     """A KNOWN_BAD_TICKERS entry (e.g. PARA, confirmed live to still return garbage) must
     return None before ever hitting the yfinance API - both to avoid re-storing the same
