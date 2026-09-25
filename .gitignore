@@ -41,3 +41,8 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Editor / local scratch
+.vscode/
+*.session.sql
+*.log
