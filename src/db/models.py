@@ -148,6 +148,11 @@ _TRADES_ADDITIVE_COLUMNS = [
 ]
 
 
+_TICKER_PRICES_ADDITIVE_COLUMNS = [
+    ("sector", "TEXT"),
+]
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Additive columns added after a DB already existed - CREATE TABLE IF NOT EXISTS in
     schema.sql only creates missing tables, it doesn't retrofit columns onto one that's
@@ -158,6 +163,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {coltype}")
     conn.commit()
     _migrate_ticker_prices(conn)
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(ticker_prices)")}
+    for name, coltype in _TICKER_PRICES_ADDITIVE_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE ticker_prices ADD COLUMN {name} {coltype}")
+    conn.commit()
 
 
 def _migrate_ticker_prices(conn: sqlite3.Connection) -> None:
@@ -223,6 +233,7 @@ class TickerPrice:
     price_status: str
     zero_streak: int
     last_checked_at: Optional[str]
+    sector: Optional[str] = None
 
 
 @dataclass
@@ -673,6 +684,28 @@ def set_benchmark_prices(conn: sqlite3.Connection, prices: list[tuple[str, float
             """INSERT INTO benchmark_prices (date, price) VALUES (?, ?)
                ON CONFLICT (date) DO UPDATE SET price = excluded.price""",
             (date, price),
+        )
+    conn.commit()
+
+
+def get_latest_sector_benchmark_date(conn: sqlite3.Connection, sector: str) -> Optional[str]:
+    """Same as get_latest_benchmark_date, scoped to one sector's own series - each sector
+    ETF backfill runs independently and needs its own catch-up window."""
+    row = conn.execute(
+        "SELECT MAX(date) AS d FROM sector_benchmark_prices WHERE sector = ?", (sector,)
+    ).fetchone()
+    return row["d"] if row else None
+
+
+def set_sector_benchmark_prices(
+    conn: sqlite3.Connection, sector: str, prices: list[tuple[str, float]]
+) -> None:
+    """Same as set_benchmark_prices, but for one sector's series in sector_benchmark_prices."""
+    for date, price in prices:
+        conn.execute(
+            """INSERT INTO sector_benchmark_prices (sector, date, price) VALUES (?, ?, ?)
+               ON CONFLICT (sector, date) DO UPDATE SET price = excluded.price""",
+            (sector, date, price),
         )
     conn.commit()
 

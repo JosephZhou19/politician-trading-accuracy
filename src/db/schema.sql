@@ -117,7 +117,11 @@ CREATE TABLE IF NOT EXISTS ticker_prices (
     price_updated_at  TEXT,
     price_status      TEXT NOT NULL DEFAULT 'active' CHECK (price_status IN ('active', 'delisted')),
     zero_streak       INTEGER NOT NULL DEFAULT 0,
-    last_checked_at   TEXT
+    last_checked_at   TEXT,
+    -- yfinance's own info['sector'] string (e.g. "Energy") - NULL until a ticker has been
+    -- looked up. Joins directly against sector_benchmark_prices.sector, same string, no
+    -- translation table needed.
+    sector            TEXT
 );
 
 -- Single-row bookmark for the trickle job: the last ticker it successfully checked, so a
@@ -139,6 +143,19 @@ CREATE TABLE IF NOT EXISTS trickle_cursor (
 CREATE TABLE IF NOT EXISTS benchmark_prices (
     date  TEXT PRIMARY KEY,
     price REAL NOT NULL
+);
+
+-- Same idea as benchmark_prices, but one series per GICS sector (via its SPDR Select
+-- Sector ETF - see SECTOR_ETFS in src/market/sectors.py) instead of one series for the
+-- whole market. Lets alpha be computed against, say, Energy peers rather than the S&P 500
+-- for a trader concentrated in one sector. sector is the exact string yfinance's own
+-- info['sector'] returns (e.g. "Energy", "Financial Services") - not a GICS code - so a
+-- ticker's sector (ticker_prices.sector) joins against this directly with no translation.
+CREATE TABLE IF NOT EXISTS sector_benchmark_prices (
+    sector TEXT NOT NULL,
+    date   TEXT NOT NULL,
+    price  REAL NOT NULL,
+    PRIMARY KEY (sector, date)
 );
 
 -- Per (legislator, ticker) estimated current stock position - a view, not a materialized
