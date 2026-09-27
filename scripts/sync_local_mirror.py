@@ -38,8 +38,6 @@ Usage:
 """
 import argparse
 import os
-import sqlite3
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -47,7 +45,6 @@ from src.db import models
 
 load_dotenv()
 
-SCHEMA_PATH = Path(__file__).parent.parent / "src" / "db" / "schema.sql"
 SMALL_TABLES = ["ticker_status", "ingestion_runs"]
 
 
@@ -62,14 +59,6 @@ def _connect_turso():
             "and target."
         )
     return models.connect("unused-since-turso-env-is-set")
-
-
-def _connect_local(db_path):
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA_PATH.read_text())
-    models._migrate(conn)
-    return conn
 
 
 def _replace_rows(local, table, rows):
@@ -275,7 +264,7 @@ def sync_ticker_daily_prices(turso, local):
 
 def sync(db_path):
     turso = _connect_turso()
-    local = _connect_local(db_path)
+    local = models.connect_local(db_path)
     local.execute("PRAGMA foreign_keys = OFF")
 
     summary = {"legislators_new": sync_append_only(turso, local, "legislators", "id")}

@@ -701,3 +701,33 @@ def test_set_benchmark_prices_round_trip_and_upsert(conn):
     assert [(r["date"], r["price"]) for r in rows] == [("2020-01-02", 105.0), ("2020-01-03", 101.0)]
 
 
+def test_bulk_insert_ticker_daily_prices_across_many_tickers(conn):
+    models.bulk_insert_ticker_daily_prices(conn, [
+        ("AAPL", "2020-01-02", 100.0), ("AAPL", "2020-01-03", 101.0),
+        ("MSFT", "2020-01-02", 200.0),
+    ])
+    rows = conn.execute("SELECT ticker, date, price FROM ticker_daily_prices ORDER BY ticker, date").fetchall()
+    assert [(r["ticker"], r["date"], r["price"]) for r in rows] == [
+        ("AAPL", "2020-01-02", 100.0), ("AAPL", "2020-01-03", 101.0), ("MSFT", "2020-01-02", 200.0),
+    ]
+
+
+def test_bulk_insert_ticker_daily_prices_upserts_on_rerun(conn):
+    models.bulk_insert_ticker_daily_prices(conn, [("AAPL", "2020-01-02", 100.0)])
+    models.bulk_insert_ticker_daily_prices(conn, [("AAPL", "2020-01-02", 105.0)])
+
+    rows = conn.execute("SELECT price FROM ticker_daily_prices WHERE ticker = 'AAPL' AND date = '2020-01-02'").fetchall()
+    assert [r["price"] for r in rows] == [105.0]
+
+
+def test_bulk_insert_ticker_daily_prices_respects_batch_size_boundary(conn):
+    """A row count that isn't an exact multiple of batch_size must not drop or duplicate the
+    trailing partial batch."""
+    rows_in = [("TICK", f"2020-01-{d:02d}", float(d)) for d in range(1, 8)]
+    models.bulk_insert_ticker_daily_prices(conn, rows_in, batch_size=3)
+
+    stored = conn.execute("SELECT date, price FROM ticker_daily_prices ORDER BY date").fetchall()
+    assert len(stored) == 7
+    assert [(r["date"], r["price"]) for r in stored] == [(d, p) for _, d, p in rows_in]
+
+

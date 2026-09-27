@@ -138,9 +138,18 @@ def main():
         "--time-budget-minutes", type=float, default=DEFAULT_TIME_BUDGET_MINUTES,
         help="Stop and save the resume cursor after this long (0 to disable and run to completion)",
     )
+    parser.add_argument(
+        "--local", action="store_true",
+        help="Run against the local mirror file at --db, ignoring TURSO_DATABASE_URL/"
+             "TURSO_AUTH_TOKEN even if set - avoids per-row Turso round-trip latency during "
+             "the heavy one-time load. Push the result to Turso afterward with "
+             "scripts/push_ticker_daily_prices_to_turso.py. Needs the local mirror's trades "
+             "table already synced (scripts/sync_local_mirror.py) - the ticker universe and "
+             "each ticker's earliest trade date come from there.",
+    )
     args = parser.parse_args()
 
-    conn = models.connect(args.db)
+    conn = models.connect_local(args.db) if args.local else models.connect(args.db)
     conn.row_factory = sqlite3.Row
     summary = backfill_ticker_daily_prices(
         conn, ticker_limit=args.ticker_limit,

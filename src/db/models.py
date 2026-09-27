@@ -135,6 +135,23 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def connect_local(db_path: str | Path) -> sqlite3.Connection:
+    """Same as connect(), but ALWAYS opens a plain local SQLite file - ignores
+    TURSO_DATABASE_URL/TURSO_AUTH_TOKEN even if both are set. For the rare script that
+    deliberately needs to bypass Turso regardless of environment (e.g.
+    scripts/sync_local_mirror.py's local side, or a heavy one-time backfill run locally
+    first specifically to avoid per-row Turso round-trip latency before a single bulk push -
+    see scripts/push_ticker_daily_prices_to_turso.py)."""
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA_PATH.read_text())
+    _migrate(conn)
+    return conn
+
+
 _TRADES_ADDITIVE_COLUMNS = [
     ("filing_status", "TEXT"),
     ("superseded_by_trade_id", "INTEGER REFERENCES trades(id)"),
@@ -684,9 +701,13 @@ def get_ticker_daily_price(conn: sqlite3.Connection, ticker: str, date: str) -> 
 def set_ticker_daily_prices(
     conn: sqlite3.Connection, ticker: str, prices: list[tuple[str, float]], *, commit: bool = True
 ) -> None:
-    """Bulk-loads (date, price) pairs for one ticker into ticker_daily_prices.
-    commit=False lets a caller batch many tickers' writes into one round-trip instead of one
-    per ticker."""
+    """Loads (date, price) pairs for one ticker into ticker_daily_prices, one execute() per
+    row - fine for the recurring incremental catch-up's small windows (a handful of rows per
+    ticker), but NOT a reduced-round-trip bulk path: against Turso, each row is still its own
+    network round-trip regardless of commit=False (which only defers the COMMIT, not the
+    INSERTs themselves). For loading many rows across many tickers at once, use
+    bulk_insert_ticker_daily_prices instead. commit=False lets a caller share one commit
+    across several tickers' worth of calls."""
     for date, price in prices:
         conn.execute(
             """INSERT INTO ticker_daily_prices (ticker, date, price) VALUES (?, ?, ?)
@@ -694,6 +715,27 @@ def set_ticker_daily_prices(
             (ticker, date, price),
         )
     if commit:
+        conn.commit()
+
+
+def bulk_insert_ticker_daily_prices(
+    conn: sqlite3.Connection, rows: list[tuple[str, str, float]], *, batch_size: int = 500
+) -> None:
+    """Loads (ticker, date, price) triples across MANY tickers via large multi-row INSERT
+    statements, chunked to stay under SQLite/Turso's bound-parameter limit (batch_size rows
+    x 3 params each). Built for scripts/push_ticker_daily_prices_to_turso.py: pushing millions
+    of rows one at a time (set_ticker_daily_prices's shape) would mean millions of Turso
+    round-trips; this cuts that down to len(rows) / batch_size. Safe to re-run (ON CONFLICT
+    DO UPDATE, same as set_ticker_daily_prices)."""
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start:start + batch_size]
+        placeholders = ",".join("(?,?,?)" for _ in batch)
+        params = [v for row in batch for v in row]
+        conn.execute(
+            f"""INSERT INTO ticker_daily_prices (ticker, date, price) VALUES {placeholders}
+                ON CONFLICT (ticker, date) DO UPDATE SET price = excluded.price""",
+            params,
+        )
         conn.commit()
 
 
