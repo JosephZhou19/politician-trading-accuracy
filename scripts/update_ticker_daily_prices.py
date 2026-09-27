@@ -20,12 +20,22 @@ Two ticker groups, handled differently:
   window, not their whole history - this is what keeps a run of ~3,500 tickers down to
   roughly 3,500/BATCH_SIZE yfinance requests instead of 3,500 individual ones.
 
+OVERLAP_DAYS is deliberately small (see its own comment) - every day in the fetched window
+gets re-upserted via set_ticker_daily_prices on every run, not just genuinely new days, so
+this number multiplies directly into Turso write volume across ~2,500+ due tickers, every
+run. Confirmed live this session: at the old value (10 calendar days, ~7 trading days),
+that was ~18,000 redundant row-writes/run for corrections we have no actual evidence occur
+at that range - see OVERLAP_DAYS's own comment for what we DO have evidence of.
+
 Split-basis guard: before upserting a "due" ticker's fetched window, its fetched price at
 its own last-already-stored date is compared against what's on record for that date (see
 REBASE_RATIO_THRESHOLD below). A mismatch means a stock split has retroactively rewritten
 yfinance's history since the last fetch - in that case ALL of the ticker's stored rows are
 now on the wrong basis, not just the missing recent days, so the whole series is re-fetched
-and replaced rather than just topped up.
+and replaced rather than just topped up. This is the real, confirmed correction mechanism -
+OVERLAP_DAYS is NOT protecting against this (a real rebase affects years of history, not a
+few days; this check catches it precisely via the ticker's own last-stored date, independent
+of window size).
 
 No resumable cursor by design (unlike the two trickle-style jobs) - a run that hits its time
 budget partway just leaves some tickers stale until the next scheduled run reprocesses the
@@ -50,10 +60,18 @@ load_dotenv()
 # number of requests (3,500 tickers / 50 = ~70 calls instead of 3,500), small enough that
 # one bad/slow batch doesn't put a huge fraction of the run at risk.
 BATCH_SIZE = 50
-# Small re-fetch window on each "due" ticker, same reasoning as backfill_spy_benchmark.py's
-# OVERLAP_DAYS - cheap insurance against the last stored day needing a correction, and
-# tolerant of this job not running literally every single day.
-OVERLAP_DAYS = 10
+# Was 10, copied from backfill_spy_benchmark.py's OVERLAP_DAYS without re-deriving whether
+# "cheap insurance" still holds once it's multiplied across ~2,500+ tickers instead of that
+# job's 1 (SPY was, and still is, genuinely cheap at any window size). It isn't cheap here -
+# confirmed live, 10 days meant ~18,000 redundant re-written rows/run. Checked what
+# correction we're actually protecting against: dividend-driven drift on old dates was
+# tested directly this session and found negligible (fetching the same historical date with
+# different end-dates years apart gave a ratio of 0.9999999 - floating-point noise, not
+# real drift); the one real correction mechanism (a stock split retroactively rewriting
+# history) is already caught precisely by the rebase check below, independent of this
+# window. What's left to justify SOME overlap: today's/yesterday's close occasionally not
+# being fully settled yet when this job runs - which only needs 1-2 days, not 10.
+OVERLAP_DAYS = 2
 # A split moving the adjustment basis by more than this since the last fetch triggers a
 # full re-fetch/replace.
 REBASE_RATIO_THRESHOLD = 1.5

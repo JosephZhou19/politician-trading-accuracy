@@ -6,7 +6,7 @@ import pytest
 
 from src.db import models
 from src.market.prices import TickerHistory
-from scripts.update_ticker_daily_prices import update_ticker_daily_prices
+from scripts.update_ticker_daily_prices import OVERLAP_DAYS, update_ticker_daily_prices
 
 
 @pytest.fixture(autouse=True)
@@ -92,8 +92,8 @@ def test_due_ticker_batch_start_date_uses_the_earliest_overlap_window_in_the_bat
         update_ticker_daily_prices(conn)
 
     called_start = mock_batch.call_args[0][1]
-    # OVERLAP_DAYS=10 back from the EARLIEST of the two tickers' last-stored dates (2026-09-01)
-    assert called_start == datetime.date(2026, 9, 1) - datetime.timedelta(days=10)
+    # OVERLAP_DAYS back from the EARLIEST of the two tickers' last-stored dates (2026-09-01)
+    assert called_start == datetime.date(2026, 9, 1) - datetime.timedelta(days=OVERLAP_DAYS)
 
 
 def test_split_detected_triggers_full_refetch_and_replace(conn):
