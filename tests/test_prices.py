@@ -8,6 +8,7 @@ from src.market.prices import (
     TickerHistory,
     _normalize_ticker,
     fetch_ticker_history,
+    fetch_ticker_histories_batch,
     fetch_ticker_history_stockanalysis,
 )
 
@@ -180,6 +181,70 @@ def test_fetch_ticker_history_accepts_ticker_with_all_positive_days():
         result = fetch_ticker_history("AAPL", datetime.date(2020, 1, 1), datetime.date(2020, 2, 1))
     assert result is not None
     assert result.price_on_or_after(datetime.date(2020, 1, 2)) == 100.0
+
+
+def _mock_batch_df(tickers_and_opens):
+    """Builds a MultiIndex(ticker, field) DataFrame matching yf.download(group_by='ticker')'s
+    real shape - confirmed live against the actual library, not guessed."""
+    all_dates = sorted({d for opens in tickers_and_opens.values() for d, _ in opens})
+    index = pd.DatetimeIndex([datetime.datetime(*d) for d in all_dates])
+    columns = pd.MultiIndex.from_tuples(
+        [(ticker, "Open") for ticker in tickers_and_opens], names=["Ticker", "Price"]
+    )
+    df = pd.DataFrame(index=index, columns=columns, dtype=float)
+    for ticker, opens in tickers_and_opens.items():
+        for d, price in opens:
+            df.loc[datetime.datetime(*d), (ticker, "Open")] = price
+    return df
+
+
+def test_fetch_ticker_histories_batch_returns_one_history_per_ticker():
+    df = _mock_batch_df({
+        "AAPL": [((2020, 1, 2), 100.0), ((2020, 1, 3), 101.0)],
+        "MSFT": [((2020, 1, 2), 200.0), ((2020, 1, 3), 202.0)],
+    })
+    with patch("src.market.prices.yf.download", return_value=df) as mock_download:
+        results = fetch_ticker_histories_batch(
+            ["AAPL", "MSFT"], datetime.date(2020, 1, 1), datetime.date(2020, 2, 1)
+        )
+    mock_download.assert_called_once()
+    assert results["AAPL"].price_on_or_after(datetime.date(2020, 1, 2)) == 100.0
+    assert results["MSFT"].price_on_or_after(datetime.date(2020, 1, 2)) == 200.0
+
+
+def test_fetch_ticker_histories_batch_skips_known_bad_ticker_without_including_it_in_the_request():
+    df = _mock_batch_df({"AAPL": [((2020, 1, 2), 100.0)]})
+    with patch("src.market.prices.yf.download", return_value=df) as mock_download:
+        results = fetch_ticker_histories_batch(
+            ["AAPL", "PARA"], datetime.date(2020, 1, 1), datetime.date(2020, 2, 1)
+        )
+    assert results["PARA"] is None
+    assert results["AAPL"].price_on_or_after(datetime.date(2020, 1, 2)) == 100.0
+    requested = mock_download.call_args[0][0]
+    assert "PARA" not in requested
+
+
+def test_fetch_ticker_histories_batch_handles_a_ticker_missing_from_the_response():
+    """Confirmed live: a bad/delisted symbol mixed into a real yf.download batch doesn't
+    raise - it just comes back all-NaN, or (here) can be entirely absent from the returned
+    columns if the library drops it outright. Either way the other tickers in the same
+    batch must still resolve normally."""
+    df = _mock_batch_df({"AAPL": [((2020, 1, 2), 100.0)]})
+    with patch("src.market.prices.yf.download", return_value=df):
+        results = fetch_ticker_histories_batch(
+            ["AAPL", "NOTAREALTICKER"], datetime.date(2020, 1, 1), datetime.date(2020, 2, 1)
+        )
+    assert results["NOTAREALTICKER"] is None
+    assert results["AAPL"].price_on_or_after(datetime.date(2020, 1, 2)) == 100.0
+
+
+def test_fetch_ticker_histories_batch_rejects_ticker_with_non_positive_day():
+    df = _mock_batch_df({"BADCO": [((2020, 1, 2), 100.0), ((2020, 1, 3), -5.0)]})
+    with patch("src.market.prices.yf.download", return_value=df):
+        results = fetch_ticker_histories_batch(
+            ["BADCO"], datetime.date(2020, 1, 1), datetime.date(2020, 2, 1)
+        )
+    assert results["BADCO"] is None
 
 
 def test_fetch_ticker_history_skips_known_bad_ticker_without_calling_yfinance():

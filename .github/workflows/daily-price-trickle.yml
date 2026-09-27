@@ -3,7 +3,7 @@ name: Daily price trickle
 on:
   schedule:
     # ~5:30pm ET, weekdays only - after the 4:00pm ET market close, with a half-hour buffer
-    # for Finnhub's own quote data to settle. ET below is EDT (UTC-4); drifts 1hr during EST
+    # for yfinance's own daily bar to settle. ET below is EDT (UTC-4); drifts 1hr during EST
     # (~Nov-Mar) since cron doesn't adjust - fine here, this job isn't time-sensitive within
     # an hour. No weekend runs: US markets are closed, so a weekend check would just spend
     # quota re-confirming Friday's close.
@@ -20,10 +20,10 @@ concurrency:
 jobs:
   update-prices:
     runs-on: ubuntu-latest
-    # The job itself self-limits to a 75-minute budget and saves a resume cursor before
-    # stopping (see scripts/update_current_prices.py) - this timeout is a backstop well
-    # beyond that, not the primary defense against a slow run.
-    timeout-minutes: 100
+    # scripts.update_ticker_daily_prices self-limits to a 30-minute budget and is cheap
+    # enough in steady state (batched yfinance calls, a small overlap window per ticker)
+    # that this timeout is a generous backstop, not the primary defense against a slow run.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -33,24 +33,22 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # Both run before the trickle step, not after: fast/predictable catch-up work first,
-      # the long-running (up to 75-minute budget) trickle step last, so a slow trickle run
-      # never blocks or delays these. Neither uses Finnhub - both are yfinance, same as the
-      # original historical backfill. backfill_spy_benchmark is incremental (a handful of
-      # rows in steady state, not the whole ~3,500-row history) so this stays fast day to
-      # day; the one large catch-up of the pre-existing backlog was run manually first.
-      - run: python -m scripts.backfill_prices
-        env:
-          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
-          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-
+      # All yfinance, no other API keys needed (this workflow no longer talks to Finnhub -
+      # see scripts/update_ticker_daily_prices.py's docstring for why that job was retired).
+      # backfill_spy_benchmark is incremental (a handful of rows in steady state, not the
+      # whole ~3,500-row history) so this stays fast day to day; the one-time full-history
+      # catch-up (backfill_ticker_daily_prices) was run manually first. The old per-trade
+      # point-price backfill (backfill_prices) is gone entirely - ticker_daily_prices now
+      # answers any price question at any horizon, computed during local analysis instead of
+      # pre-computed at write time (see PLAN.md).
       - run: python -m scripts.backfill_spy_benchmark
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
 
-      - run: python -m scripts.update_current_prices
+      # Last: keeps ticker_daily_prices current AND derives ticker_status (delisting
+      # tracking) from the same fetch (replaces the old Finnhub trickle entirely).
+      - run: python -m scripts.update_ticker_daily_prices
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}

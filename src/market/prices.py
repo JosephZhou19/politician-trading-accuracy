@@ -104,12 +104,13 @@ class TickerHistory:
 # since several of these sit in a range indistinguishable from a real ultra-high-price
 # stock like BRK.A without a threshold that would eventually reject BRK.A itself; see
 # MAX_PLAUSIBLE_PRICE's comment). Checked live and confirmed still broken as of 2026-09-20.
-# These are real, actively-traded companies - do NOT add them to ticker_prices as
-# 'delisted', which would also (wrongly) stop tracking their real current price via
-# Finnhub; this list only ever affects the yfinance historical-price path. Skipped before
-# the API call entirely (saves the request, not just the bad data). No automatic recheck -
-# if yfinance ever fixes its own historical data for one of these, the only cost of not
-# noticing is staying unpriced, never a wrong price; revisit manually if that matters.
+# These are real, actively-traded companies - do NOT add them to ticker_status as
+# 'delisted', which would also (wrongly) stop tracking them via
+# update_ticker_daily_prices.py; this list only ever affects the yfinance historical-price
+# path. Skipped before the API call entirely (saves the request, not just the bad data). No
+# automatic recheck - if yfinance ever fixes its own historical data for one of these, the
+# only cost of not noticing is staying unpriced, never a wrong price; revisit manually if
+# that matters.
 #
 # NOTE (2026-09-25): SUNE, NVVE, APVO and REVB were removed from this list after directly
 # checking their split histories - each has done repeated real reverse stock splits, and
@@ -130,6 +131,20 @@ KNOWN_BAD_TICKERS = frozenset({
 })
 
 
+def _has_non_positive_price(opens: pd.Series) -> bool:
+    """A single implausible value gets skipped in place by MIN/MAX_PLAUSIBLE_PRICE, but a
+    ticker whose history contains ANY day at or below $0 is a different, worse signal -
+    confirmed live (2026-09) against 3,011 real tickers already in this DB: 6 of the 12
+    known-bad tickers (DAIUF, AOZOF, AEXAY, OCLCF, JGCCF, KOSCF) have hundreds to thousands
+    of zero/negative days apiece, and zero of the 3,011 real tickers have even one - except
+    2 legitimate money-market funds whose entire "history" is a single $0 day, which
+    correctly SHOULD be rejected (they have no real daily price to give). A real stock's
+    Open is never $0 or negative even on its worst day, so this is a safe whole-ticker
+    reject, not a per-day skip - shared by both fetch_ticker_history and
+    fetch_ticker_histories_batch below."""
+    return bool((opens <= 0).any())
+
+
 def fetch_ticker_history(
     ticker: str, start_date: datetime.date, end_date: datetime.date
 ) -> TickerHistory | None:
@@ -137,8 +152,8 @@ def fetch_ticker_history(
     the ticker has no data at all in that range (delisted, renamed - e.g. Yahoo serves no
     history at all under the dead "FB" symbol, only "META" - or a disclosure typo), it's in
     KNOWN_BAD_TICKERS (yfinance has data, but it's confirmed garbage), or its downloaded
-    history contains any day at or below $0 (see the comment below) - either way a caller
-    should treat this as "can't price this trade", not a crash.
+    history contains any day at or below $0 (see _has_non_positive_price) - either way a
+    caller should treat this as "can't price this trade", not a crash.
 
     end_date is padded by a few days past yfinance's exclusive end-of-range so the exact
     end_date requested is actually included, and so a target that lands on end_date itself
@@ -153,19 +168,60 @@ def fetch_ticker_history(
         return None
     opens = history["Open"]
     opens.index = opens.index.date
-    # A single implausible value gets skipped in place by MIN/MAX_PLAUSIBLE_PRICE, but a
-    # ticker whose history contains ANY day at or below $0 is a different, worse signal -
-    # confirmed live (2026-09) against 3,011 real tickers already in this DB: 6 of the 12
-    # known-bad tickers (DAIUF, AOZOF, AEXAY, OCLCF, JGCCF, KOSCF) have hundreds to
-    # thousands of zero/negative days apiece, and zero of the 3,011 real tickers have even
-    # one - except 2 legitimate money-market funds whose entire "history" is a single $0
-    # day, which correctly SHOULD be rejected (they have no real daily price to give). A
-    # real stock's Open is never $0 or negative even on its worst day, so this is a safe
-    # whole-ticker reject, not a per-day skip - it also catches the next OTC ticker in this
-    # class before it needs to be hand-added to KNOWN_BAD_TICKERS.
-    if (opens <= 0).any():
+    if _has_non_positive_price(opens):
         return None
     return TickerHistory(ticker, opens)
+
+
+def fetch_ticker_histories_batch(
+    tickers: list[str], start_date: datetime.date, end_date: datetime.date
+) -> dict[str, TickerHistory | None]:
+    """Same Open-price fetch as fetch_ticker_history, but for many tickers in ONE yfinance
+    request instead of one request per ticker. Confirmed live: yf.download's
+    group_by='ticker' mode tolerates a bad/delisted symbol mixed into the batch (that
+    ticker's columns come back all-NaN, not an exception - every other ticker in the same
+    batch still resolves normally), and a length-1 ticker list still comes back with the
+    same MultiIndex column shape as a real batch, so no size-1 special case is needed.
+
+    This exists specifically to keep the recurring catch-up (update_ticker_daily_prices.py)
+    cheap: refreshing ~3,500 tickers' most recent few days one ticker at a time would mean
+    ~3,500 individual API calls on every run, the exact rate-limit exposure a caller batching
+    tickers here is trying to avoid. Not used by fetch_ticker_history's callers, which need a
+    different start_date per ticker (their own earliest trade date) - this function's whole
+    point is a single shared date range across many tickers at once.
+
+    Returns a dict with every requested ticker as a key. A value is None for a
+    KNOWN_BAD_TICKERS entry (skipped before the request, same as fetch_ticker_history), a
+    ticker yfinance returned nothing for at all, or one whose window fails
+    _has_non_positive_price.
+    """
+    normalized_map = {t: _normalize_ticker(t) for t in tickers}
+    to_fetch = [orig for orig, norm in normalized_map.items() if norm not in KNOWN_BAD_TICKERS]
+    results: dict[str, TickerHistory | None] = {
+        orig: None for orig, norm in normalized_map.items() if norm in KNOWN_BAD_TICKERS
+    }
+    if not to_fetch:
+        return results
+
+    padded_end = end_date + datetime.timedelta(days=5)
+    normalized_list = [normalized_map[orig] for orig in to_fetch]
+    df = yf.download(
+        normalized_list, start=start_date, end=padded_end, group_by="ticker",
+        auto_adjust=True, progress=False, threads=True,
+    )
+    available = set(df.columns.get_level_values(0))
+    for orig in to_fetch:
+        norm = normalized_map[orig]
+        if norm not in available:
+            results[orig] = None
+            continue
+        opens = df[norm]["Open"]
+        opens.index = opens.index.date
+        if opens.isna().all() or _has_non_positive_price(opens):
+            results[orig] = None
+            continue
+        results[orig] = TickerHistory(orig, opens)
+    return results
 
 
 def fetch_ticker_history_stockanalysis(ticker: str) -> TickerHistory | None:

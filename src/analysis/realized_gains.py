@@ -35,13 +35,20 @@ a sale with no purchase to match against - that's 94% of unpriced_sale_dollars o
 hardest: median sale_coverage (realized_proceeds / (realized_proceeds +
 unpriced_sale_dollars)) across all legislators is ~8%. Always check a legislator's
 coverage before trusting their realized_gain figure in isolation.
+
+Each trade's price (both a purchase's cost basis and a sale's proceeds) is looked up from
+ticker_daily_prices via src.analysis.price_lookup rather than a pre-computed column - see
+PLAN.md for why the old price_at_transaction column was retired in favor of this.
 """
 
 from __future__ import annotations
 
+import datetime
 import sqlite3
 from collections import deque
 from dataclasses import dataclass
+
+from src.analysis.price_lookup import load_price_histories
 
 
 @dataclass
@@ -58,8 +65,8 @@ def compute_realized_gains(conn: sqlite3.Connection) -> dict[int, RealizedGainRe
     entry, even if it's all zeros (no sales yet is a real 0.0, not missing data)."""
     rows = conn.execute(
         """
-        SELECT f.legislator_id, t.ticker, t.transaction_type,
-               t.amount_low, t.amount_high, t.price_at_transaction
+        SELECT f.legislator_id, t.ticker, t.transaction_type, t.transaction_date,
+               t.amount_low, t.amount_high
         FROM trades t JOIN filings f ON f.id = t.filing_id
         WHERE t.asset_type IN ('ST', 'Stock')
           AND t.ticker IS NOT NULL AND t.ticker != ''
@@ -67,6 +74,8 @@ def compute_realized_gains(conn: sqlite3.Connection) -> dict[int, RealizedGainRe
         ORDER BY f.legislator_id, t.ticker, t.transaction_date, t.id
         """
     ).fetchall()
+
+    histories = load_price_histories(conn, [row["ticker"] for row in rows])
 
     results: dict[int, RealizedGainResult] = {}
     lots: deque[list] = deque()
@@ -80,13 +89,18 @@ def compute_realized_gains(conn: sqlite3.Connection) -> dict[int, RealizedGainRe
 
         result = results.setdefault(row["legislator_id"], RealizedGainResult(row["legislator_id"]))
         amount_mid = (row["amount_low"] + (row["amount_high"] or row["amount_low"])) / 2.0
+        history = histories.get(row["ticker"])
+        price = (
+            history.price_on_or_after(datetime.date.fromisoformat(row["transaction_date"]))
+            if history is not None else None
+        )
 
         if row["transaction_type"] == "purchase":
-            lots.append([amount_mid, row["price_at_transaction"]])
+            lots.append([amount_mid, price])
             continue
 
         remaining = amount_mid
-        sale_price = row["price_at_transaction"]
+        sale_price = price
         while remaining > 1e-9 and lots:
             lot = lots[0]
             consumed = min(remaining, lot[0])

@@ -5,8 +5,10 @@ Keys are yfinance's own info['sector'] strings, confirmed live against represent
 tickers rather than assumed (yfinance's taxonomy differs slightly from GICS naming, e.g.
 "Consumer Cyclical"/"Consumer Defensive" instead of "Consumer Discretionary"/"Consumer
 Staples", "Financial Services" and "Basic Materials" instead of "Financials"/"Materials") -
-ticker_prices.sector stores this same string, so it joins straight into
-sector_benchmark_prices.sector with no translation.
+whatever eventually maps a ticker to a sector can join straight into
+sector_benchmark_prices.sector with no translation, using this same string. NOTE: nothing
+populates a per-ticker sector anywhere in this codebase yet (see sector_benchmark_prices'
+own comment in schema.sql) - this mapping and that table both currently have no consumer.
 """
 
 SECTOR_ETFS = {

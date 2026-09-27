@@ -1,5 +1,5 @@
-"""One-time backfill: labels every ticker with zero historical price data anywhere
-(confirmed dead/acquired/merged - see PLAN.md) as price_status='delisted' in ticker_prices.
+"""One-time backfill: labels every ticker with zero rows in ticker_daily_prices
+(confirmed dead/acquired/merged - see PLAN.md) as status='delisted' in ticker_status.
 See models.backfill_delisted_status for why.
 
 Usage:

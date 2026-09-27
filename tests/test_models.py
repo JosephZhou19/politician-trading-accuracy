@@ -532,11 +532,9 @@ def test_turso_does_not_log_fast_call():
     mock_logger.warning.assert_not_called()
 
 
-def _insert_priced_trade(conn, ticker, *, source_row_number=1, price_at_transaction=100.0):
-    """A trade with real historical price data - the kind that puts its ticker in the
-    price-trickle job's work queue."""
+def _insert_trade(conn, ticker, *, source_row_number=1):
     filing_id = _insert_test_filing(conn, external_filing_id=f"filing-{ticker}-{source_row_number}")
-    trade_id = models.insert_trade(
+    return models.insert_trade(
         conn,
         filing_id=filing_id,
         source_row_number=source_row_number,
@@ -549,163 +547,139 @@ def _insert_priced_trade(conn, ticker, *, source_row_number=1, price_at_transact
         amount_low=1001,
         owner="self",
     )
-    if price_at_transaction is not None:
-        models.set_trade_prices(conn, trade_id, {"price_at_transaction": price_at_transaction})
-    return trade_id
 
 
-def test_ticker_with_no_price_data_is_excluded_from_price_check_universe(conn):
-    _insert_priced_trade(conn, "AAPL")
-    _insert_priced_trade(conn, "DEADCO", price_at_transaction=None)  # never priced - known-dead
+def test_record_ticker_seen_then_missed_does_not_flip_status(conn):
+    _insert_trade(conn, "AAPL")
+    models.record_ticker_seen(conn, "AAPL", "2026-01-01T00:00:00Z")
+    models.record_ticker_missed(conn, "AAPL", "2026-01-02T00:00:00Z")
 
-    due = models.get_tickers_due_for_price_check(conn)
-
-    assert "AAPL" in due
-    assert "DEADCO" not in due
-
-
-def test_new_ticker_is_due_for_a_check(conn):
-    _insert_priced_trade(conn, "AAPL")
-    assert "AAPL" in models.get_tickers_due_for_price_check(conn)
-
-
-def test_record_real_price_then_zero_response_does_not_erase_it(conn):
-    _insert_priced_trade(conn, "AAPL")
-    models.record_real_price(conn, "AAPL", 200.50, "2026-01-01T00:00:00Z")
-    models.record_zero_response(conn, "AAPL", "2026-01-02T00:00:00Z")
-
-    tp = models.get_ticker_price(conn, "AAPL")
-    assert tp.current_price == 200.50  # frozen, not overwritten by the zero
-    assert tp.price_status == "active"
-    assert tp.zero_streak == 1
+    ts = models.get_ticker_status(conn, "AAPL")
+    assert ts.status == "active"
+    assert ts.zero_streak == 1
 
 
 def test_zero_streak_flips_to_delisted_at_threshold(conn):
-    _insert_priced_trade(conn, "AAPL")
+    _insert_trade(conn, "AAPL")
     for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD - 1):
-        models.record_zero_response(conn, "AAPL", "2026-01-01T00:00:00Z")
-    assert models.get_ticker_price(conn, "AAPL").price_status == "active"
+        models.record_ticker_missed(conn, "AAPL", "2026-01-01T00:00:00Z")
+    assert models.get_ticker_status(conn, "AAPL").status == "active"
 
-    models.record_zero_response(conn, "AAPL", "2026-01-15T00:00:00Z")
+    models.record_ticker_missed(conn, "AAPL", "2026-01-15T00:00:00Z")
 
-    tp = models.get_ticker_price(conn, "AAPL")
-    assert tp.price_status == "delisted"
-    assert tp.zero_streak == models.ZERO_STREAK_DELIST_THRESHOLD
+    ts = models.get_ticker_status(conn, "AAPL")
+    assert ts.status == "delisted"
+    assert ts.zero_streak == models.ZERO_STREAK_DELIST_THRESHOLD
 
 
-def test_real_price_resets_zero_streak(conn):
-    _insert_priced_trade(conn, "AAPL")
-    models.record_zero_response(conn, "AAPL", "2026-01-01T00:00:00Z")
-    models.record_zero_response(conn, "AAPL", "2026-01-02T00:00:00Z")
-    models.record_real_price(conn, "AAPL", 150.0, "2026-01-03T00:00:00Z")
+def test_ticker_seen_resets_zero_streak(conn):
+    _insert_trade(conn, "AAPL")
+    models.record_ticker_missed(conn, "AAPL", "2026-01-01T00:00:00Z")
+    models.record_ticker_missed(conn, "AAPL", "2026-01-02T00:00:00Z")
+    models.record_ticker_seen(conn, "AAPL", "2026-01-03T00:00:00Z")
 
-    tp = models.get_ticker_price(conn, "AAPL")
-    assert tp.zero_streak == 0
-    assert tp.price_status == "active"
-    assert tp.current_price == 150.0
+    ts = models.get_ticker_status(conn, "AAPL")
+    assert ts.zero_streak == 0
+    assert ts.status == "active"
 
 
 def test_delisted_ticker_is_excluded_until_recheck_window(conn):
     just_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    _insert_priced_trade(conn, "AAPL")
+    _insert_trade(conn, "AAPL")
     for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD):
-        models.record_zero_response(conn, "AAPL", just_now)
-    assert models.get_ticker_price(conn, "AAPL").price_status == "delisted"
+        models.record_ticker_missed(conn, "AAPL", just_now)
+    assert models.get_ticker_status(conn, "AAPL").status == "delisted"
 
     # Just flagged - not due again immediately.
-    assert "AAPL" not in models.get_tickers_due_for_price_check(conn)
+    assert models.filter_active_or_recheckable(conn, ["AAPL"]) == []
 
     # But a delisted ticker checked too long ago is due again (the monthly safety net).
     conn.execute(
-        "UPDATE ticker_prices SET last_checked_at = ? WHERE ticker = ?",
+        "UPDATE ticker_status SET last_checked_at = ? WHERE ticker = ?",
         ("2020-01-01T00:00:00Z", "AAPL"),
     )
     conn.commit()
-    assert "AAPL" in models.get_tickers_due_for_price_check(conn)
+    assert models.filter_active_or_recheckable(conn, ["AAPL"]) == ["AAPL"]
 
 
 def test_delisted_ticker_that_trades_again_reactivates(conn):
-    _insert_priced_trade(conn, "AAPL")
+    _insert_trade(conn, "AAPL")
     for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD):
-        models.record_zero_response(conn, "AAPL", "2026-01-01T00:00:00Z")
+        models.record_ticker_missed(conn, "AAPL", "2026-01-01T00:00:00Z")
 
-    models.record_real_price(conn, "AAPL", 42.0, "2026-02-01T00:00:00Z")
+    models.record_ticker_seen(conn, "AAPL", "2026-02-01T00:00:00Z")
 
-    tp = models.get_ticker_price(conn, "AAPL")
-    assert tp.price_status == "active"
-    assert tp.zero_streak == 0
-    assert "AAPL" in models.get_tickers_due_for_price_check(conn)
+    ts = models.get_ticker_status(conn, "AAPL")
+    assert ts.status == "active"
+    assert ts.zero_streak == 0
+    assert models.filter_active_or_recheckable(conn, ["AAPL"]) == ["AAPL"]
 
 
-def test_backfill_delisted_status_labels_only_tickers_with_zero_price_history(conn):
-    _insert_priced_trade(conn, "AAPL")
-    _insert_priced_trade(conn, "DEADCO", price_at_transaction=None)
+def test_backfill_delisted_status_labels_only_tickers_with_zero_daily_price_history(conn):
+    _insert_trade(conn, "AAPL")
+    models.set_ticker_daily_prices(conn, "AAPL", [("2026-01-05", 100.0)])
+    _insert_trade(conn, "DEADCO")  # no ticker_daily_prices rows at all
 
     count = models.backfill_delisted_status(conn)
 
     assert count == 1
-    assert models.get_ticker_price(conn, "AAPL") is None
-    dead = models.get_ticker_price(conn, "DEADCO")
-    assert dead.price_status == "delisted"
-    assert dead.current_price is None
+    assert models.get_ticker_status(conn, "AAPL") is None
+    dead = models.get_ticker_status(conn, "DEADCO")
+    assert dead.status == "delisted"
     assert dead.last_checked_at is None
     assert dead.zero_streak == models.ZERO_STREAK_DELIST_THRESHOLD
 
 
 def test_backfill_delisted_status_does_not_touch_or_double_count_existing_rows(conn):
-    _insert_priced_trade(conn, "DEADCO", price_at_transaction=None)
+    _insert_trade(conn, "DEADCO")
     models.backfill_delisted_status(conn)
 
     # A second run must not re-count or overwrite the row it already labeled.
     second_count = models.backfill_delisted_status(conn)
 
     assert second_count == 0
-    assert models.get_ticker_price(conn, "DEADCO").price_status == "delisted"
+    assert models.get_ticker_status(conn, "DEADCO").status == "delisted"
 
 
 def test_backfill_delisted_status_skips_ticker_already_tracked_as_active(conn):
-    """A ticker that has zero price history but is already in ticker_prices for some other
-    reason (e.g. a manual entry) must not be silently relabeled delisted."""
-    _insert_priced_trade(conn, "DEADCO", price_at_transaction=None)
-    models.record_real_price(conn, "DEADCO", 5.0, "2026-01-01T00:00:00Z")
+    """A ticker that has zero daily-price history but is already in ticker_status for some
+    other reason (e.g. a manual entry) must not be silently relabeled delisted."""
+    _insert_trade(conn, "DEADCO")
+    models.record_ticker_seen(conn, "DEADCO", "2026-01-01T00:00:00Z")
 
     models.backfill_delisted_status(conn)
 
-    assert models.get_ticker_price(conn, "DEADCO").price_status == "active"
+    assert models.get_ticker_status(conn, "DEADCO").status == "active"
 
 
-def test_trickle_cursor_round_trip(conn):
-    assert models.get_trickle_cursor(conn) is None
-    models.set_trickle_cursor(conn, "AAPL")
-    assert models.get_trickle_cursor(conn) == "AAPL"
-    models.set_trickle_cursor(conn, "MSFT")
-    assert models.get_trickle_cursor(conn) == "MSFT"
+def test_daily_price_backfill_cursor_round_trip(conn):
+    assert models.get_daily_price_backfill_cursor(conn) is None
+    models.set_daily_price_backfill_cursor(conn, "AAPL")
+    assert models.get_daily_price_backfill_cursor(conn) == "AAPL"
+    models.set_daily_price_backfill_cursor(conn, "MSFT")
+    assert models.get_daily_price_backfill_cursor(conn) == "MSFT"
 
 
-def test_trickle_cursor_can_be_cleared(conn):
-    models.set_trickle_cursor(conn, "AAPL")
-    models.set_trickle_cursor(conn, None)
-    assert models.get_trickle_cursor(conn) is None
+def test_daily_price_backfill_cursor_can_be_cleared(conn):
+    models.set_daily_price_backfill_cursor(conn, "AAPL")
+    models.set_daily_price_backfill_cursor(conn, None)
+    assert models.get_daily_price_backfill_cursor(conn) is None
 
 
-def test_tickers_due_for_price_check_are_ordered(conn):
-    _insert_priced_trade(conn, "MSFT")
-    _insert_priced_trade(conn, "AAPL", source_row_number=2)
-    _insert_priced_trade(conn, "GOOG", source_row_number=3)
-
-    assert models.get_tickers_due_for_price_check(conn) == ["AAPL", "GOOG", "MSFT"]
+def test_filter_active_or_recheckable_passes_through_never_checked_tickers(conn):
+    assert models.filter_active_or_recheckable(conn, ["AAPL", "MSFT"]) == ["AAPL", "MSFT"]
 
 
 def test_record_functions_can_defer_commit(conn):
-    _insert_priced_trade(conn, "AAPL")
-    models.record_real_price(conn, "AAPL", 100.0, "2026-01-01T00:00:00Z", commit=False)
+    _insert_trade(conn, "AAPL")
+    models.record_ticker_seen(conn, "AAPL", "2026-01-01T00:00:00Z", commit=False)
     # Uncommitted writes are still visible on the same connection (no separate reader here),
     # so this mainly confirms the call succeeds without raising when commit=False.
-    assert models.get_ticker_price(conn, "AAPL").current_price == 100.0
+    assert models.get_ticker_status(conn, "AAPL").status == "active"
 
 
 def test_earliest_stock_trade_date_ignores_non_stock_and_unticketed(conn):
-    _insert_priced_trade(conn, "AAPL")
+    _insert_trade(conn, "AAPL")
     conn.execute(
         "UPDATE trades SET transaction_date = '2015-06-01' WHERE ticker = 'AAPL'"
     )
@@ -727,73 +701,3 @@ def test_set_benchmark_prices_round_trip_and_upsert(conn):
     assert [(r["date"], r["price"]) for r in rows] == [("2020-01-02", 105.0), ("2020-01-03", 101.0)]
 
 
-def _insert_trade_with_prices(conn, ticker, *, transaction_date="2020-01-05",
-                               notification_date="2020-01-20", **price_columns):
-    trade_id = models.insert_trade(
-        conn, filing_id=_insert_test_filing(conn, external_filing_id=f"filing-{ticker}-{transaction_date}"),
-        source_row_number=1, ticker=ticker, asset_name=f"{ticker} Inc.", asset_type="Stock",
-        transaction_type="purchase", transaction_date=transaction_date,
-        notification_date=notification_date, amount_low=1000, owner="self",
-    )
-    if price_columns:
-        models.set_trade_prices(conn, trade_id, price_columns)
-    return trade_id
-
-
-def test_needing_prices_excludes_fully_priced_trade(conn):
-    _insert_trade_with_prices(conn, "AAPL", price_at_transaction=100.0, price_at_notification=100.0,
-                              price_30d=100.0, price_90d=100.0, price_180d=100.0, price_365d=100.0)
-    assert models.get_trades_needing_prices(conn, today="2026-01-01") == []
-
-
-def test_needing_prices_includes_trade_missing_transaction_price_regardless_of_date(conn):
-    _insert_trade_with_prices(conn, "AAPL")  # no prices at all
-    trades = models.get_trades_needing_prices(conn, today="2020-01-06")
-    assert len(trades) == 1
-
-
-def test_needing_prices_excludes_horizon_not_yet_arrived(conn):
-    """Regression: a horizon whose date hasn't arrived yet (per the SAME `today` reference
-    used here) must not appear in the queue, even if every earlier price is already set -
-    confirmed for real against production that a mismatched 'today' (SQLite's UTC
-    date('now') vs. the backfill script's local date) silently included premature trades,
-    wasting a real yfinance fetch for a ticker with nothing actually fillable yet."""
-    _insert_trade_with_prices(
-        conn, "AAPL", transaction_date="2026-06-16",
-        price_at_transaction=100.0, price_at_notification=100.0, price_30d=100.0,
-    )
-    # 90-day horizon is 2026-09-14; "today" one day earlier must not include it yet.
-    assert models.get_trades_needing_prices(conn, today="2026-09-13") == []
-    assert len(models.get_trades_needing_prices(conn, today="2026-09-14")) == 1
-
-
-def test_needing_prices_default_today_uses_local_date_not_utc(conn):
-    """The whole point of the fix: with no explicit `today`, this must match Python's local
-    date(), not SQLite's date('now') (UTC) - the two can disagree by a full day."""
-    local_today = datetime.date.today()
-    _insert_trade_with_prices(
-        conn, "AAPL", transaction_date=(local_today - datetime.timedelta(days=100)).isoformat(),
-        price_at_transaction=100.0, price_at_notification=100.0,
-    )
-    # 90-day horizon already passed relative to local today - must show up with no `today` passed.
-    assert len(models.get_trades_needing_prices(conn)) == 1
-
-
-def test_needing_prices_excludes_confirmed_delisted_ticker(conn):
-    """Regression: retrying a ticker already confirmed to have zero yfinance data forever
-    wastes a real fetch on every single run for no possible benefit - confirmed for real
-    against production (776 delisted tickers being silently retried every run)."""
-    _insert_trade_with_prices(conn, "DEAD")  # no prices - would otherwise be in the queue
-    checked_at = "2026-01-01T00:00:00Z"
-    for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD):
-        models.record_zero_response(conn, "DEAD", checked_at)
-    assert models.get_ticker_price(conn, "DEAD").price_status == "delisted"
-
-    assert models.get_trades_needing_prices(conn, today="2026-01-01") == []
-
-
-def test_needing_prices_still_includes_active_ticker_with_no_price_row(conn):
-    """The delisted exclusion must not accidentally exclude tickers that simply don't have
-    a ticker_prices row yet (the normal case for a trade never priced before)."""
-    _insert_trade_with_prices(conn, "AAPL")
-    assert len(models.get_trades_needing_prices(conn, today="2020-01-06")) == 1

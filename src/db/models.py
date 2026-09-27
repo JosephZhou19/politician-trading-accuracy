@@ -139,57 +139,43 @@ _TRADES_ADDITIVE_COLUMNS = [
     ("filing_status", "TEXT"),
     ("superseded_by_trade_id", "INTEGER REFERENCES trades(id)"),
     ("reconciliation_note", "TEXT"),
-    ("price_at_transaction", "REAL"),
-    ("price_at_notification", "REAL"),
-    ("price_30d", "REAL"),
-    ("price_90d", "REAL"),
-    ("price_180d", "REAL"),
-    ("price_365d", "REAL"),
+]
+
+# Retired in favor of ticker_daily_prices (full history, one source of truth instead of three
+# overlapping ones) - dropped from any DB that still has them from before this migration.
+_TRADES_REMOVED_COLUMNS = [
+    "price_at_transaction", "price_at_notification",
+    "price_30d", "price_90d", "price_180d", "price_365d",
 ]
 
 
-_TICKER_PRICES_ADDITIVE_COLUMNS = [
-    ("sector", "TEXT"),
-]
+# Retired along with the point-price columns/ticker_prices they read - schema.sql no longer
+# creates these, but an existing DB (this one confirmed live: dropping a column SQLite says
+# is "used" by a view raises, even with the view's own definition already gone from
+# schema.sql) still has the OLD view objects sitting in sqlite_master until explicitly
+# dropped. Must run BEFORE the DROP COLUMN below on every existing DB, production included.
+_RETIRED_VIEWS = ("politician_ticker_positions", "politician_totals", "politician_yearly_activity")
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Additive columns added after a DB already existed - CREATE TABLE IF NOT EXISTS in
-    schema.sql only creates missing tables, it doesn't retrofit columns onto one that's
-    already there."""
+    """Additive/removed columns applied after a DB already existed - CREATE TABLE IF NOT
+    EXISTS in schema.sql only creates missing tables, it doesn't retrofit columns onto one
+    that's already there."""
+    for view in _RETIRED_VIEWS:
+        conn.execute(f"DROP VIEW IF EXISTS {view}")
+    conn.commit()
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
     for name, coltype in _TRADES_ADDITIVE_COLUMNS:
         if name not in existing:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {coltype}")
+    for name in _TRADES_REMOVED_COLUMNS:
+        if name in existing:
+            conn.execute(f"ALTER TABLE trades DROP COLUMN {name}")
     conn.commit()
-    _migrate_ticker_prices(conn)
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(ticker_prices)")}
-    for name, coltype in _TICKER_PRICES_ADDITIVE_COLUMNS:
-        if name not in existing:
-            conn.execute(f"ALTER TABLE ticker_prices ADD COLUMN {name} {coltype}")
-    conn.commit()
-
-
-def _migrate_ticker_prices(conn: sqlite3.Connection) -> None:
-    """ticker_prices originally had NOT NULL current_price/price_updated_at, before the
-    price-trickle job's zero_streak tracking needed to represent "no real price seen yet."
-    SQLite can't drop a NOT NULL constraint via ALTER, so this drops and recreates the table -
-    safe because it was created but never populated (no trickle job existed yet to write to
-    it) as of this migration."""
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(ticker_prices)")}
-    if not existing or "price_status" in existing:
-        return
-    conn.execute("DROP TABLE ticker_prices")
-    conn.executescript(
-        """CREATE TABLE ticker_prices (
-               ticker            TEXT PRIMARY KEY,
-               current_price     REAL,
-               price_updated_at  TEXT,
-               price_status      TEXT NOT NULL DEFAULT 'active' CHECK (price_status IN ('active', 'delisted')),
-               zero_streak       INTEGER NOT NULL DEFAULT 0,
-               last_checked_at   TEXT
-           );"""
-    )
+    # Retired wholesale, same reasoning as the trades columns above - current_price is now
+    # just the latest row in ticker_daily_prices; delisting-tracking moved to the slimmer
+    # ticker_status table (see schema.sql).
+    conn.execute("DROP TABLE IF EXISTS ticker_prices")
     conn.commit()
 
 
@@ -226,14 +212,11 @@ class Filing:
 
 
 @dataclass
-class TickerPrice:
+class TickerStatus:
     ticker: str
-    current_price: Optional[float]
-    price_updated_at: Optional[str]
-    price_status: str
+    status: str
     zero_streak: int
     last_checked_at: Optional[str]
-    sector: Optional[str] = None
 
 
 @dataclass
@@ -255,12 +238,6 @@ class Trade:
     filing_status: Optional[str]
     superseded_by_trade_id: Optional[int]
     reconciliation_note: Optional[str]
-    price_at_transaction: Optional[float]
-    price_at_notification: Optional[float]
-    price_30d: Optional[float]
-    price_90d: Optional[float]
-    price_180d: Optional[float]
-    price_365d: Optional[float]
 
 
 def _row_to_filing(row: sqlite3.Row) -> Filing:
@@ -485,67 +462,6 @@ def set_trade_reconciliation_note(conn: sqlite3.Connection, trade_id: int, note:
         conn.commit()
 
 
-PRICE_COLUMNS = (
-    "price_at_transaction", "price_at_notification",
-    "price_30d", "price_90d", "price_180d", "price_365d",
-)
-# Trading-day offset from transaction_date for each horizon column, in the order a trade's
-# journey through them actually happens - used by the daily catch-up job to know which date
-# to test each column against.
-HORIZON_COLUMNS = (("price_30d", 30), ("price_90d", 90), ("price_180d", 180), ("price_365d", 365))
-
-
-def set_trade_prices(conn: sqlite3.Connection, trade_id: int, prices: dict, *, commit: bool = True) -> None:
-    """Sets one or more price columns on a trade in a single UPDATE - a ticker with
-    thousands of trades (e.g. MSFT) would otherwise mean up to 6 separate network
-    round-trips per trade against Turso just to set that trade's own prices. commit=False
-    lets a caller batch many trades' worth of writes into one commit (e.g. per ticker group)
-    instead of one round-trip per trade."""
-    bad = set(prices) - set(PRICE_COLUMNS)
-    if bad:
-        raise ValueError(f"not price column(s): {bad}")
-    if not prices:
-        return
-    assignments = ", ".join(f"{col} = ?" for col in prices)
-    conn.execute(f"UPDATE trades SET {assignments} WHERE id = ?", (*prices.values(), trade_id))
-    if commit:
-        conn.commit()
-
-
-def get_trades_needing_prices(conn: sqlite3.Connection, today: Optional[str] = None) -> list[Trade]:
-    """Ticker'd trades with at least one currently-fetchable price still unset: transaction/
-    notification price (always fetchable - both dates are already in the past by the time a
-    trade exists at all), or a 30/90/180/365-day horizon whose date has now arrived. This is
-    the shared work queue for both the one-time historical backfill and the daily catch-up
-    job - the same trade can reappear here across several days as later horizons arrive.
-
-    today defaults to Python's local date, not SQLite's date('now') (which is UTC) -
-    confirmed these disagree for several hours every evening in US time zones, which was
-    silently inflating this queue with trades whose horizon looked arrived here but wasn't
-    once backfill_prices.py's own (local-time) date check ran, wasting a real yfinance
-    fetch for no benefit. Also excludes tickers already confirmed permanently delisted
-    (backfill_delisted_status) - retrying a ticker with zero yfinance data forever wastes a
-    fetch on every single run for no possible benefit."""
-    if today is None:
-        today = datetime.date.today().isoformat()
-    horizon_conditions = " OR ".join(
-        f"({col} IS NULL AND date(transaction_date, '+{days} days') <= date(?))"
-        for col, days in HORIZON_COLUMNS
-    )
-    params = [today] * len(HORIZON_COLUMNS)
-    rows = conn.execute(
-        f"""SELECT * FROM trades t WHERE t.ticker IS NOT NULL AND t.ticker != '' AND (
-                t.price_at_transaction IS NULL OR t.price_at_notification IS NULL
-                OR {horizon_conditions}
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM ticker_prices tp WHERE tp.ticker = t.ticker AND tp.price_status = 'delisted'
-            )""",
-        params,
-    ).fetchall()
-    return [_row_to_trade(row) for row in rows]
-
-
 def get_trades_for_filing(conn: sqlite3.Connection, filing_id: int) -> list[Trade]:
     rows = conn.execute(
         "SELECT * FROM trades WHERE filing_id = ? ORDER BY id", (filing_id,)
@@ -560,103 +476,56 @@ def delete_trades_for_filing(conn: sqlite3.Connection, filing_id: int) -> None:
     conn.commit()
 
 
-# Consecutive daily zero-responses from Finnhub required before concluding a ticker is
-# actually delisted, not just mid trading-halt - anchored to SEC Rule 12(k), which caps an
-# ordinary trading suspension at 10 business days, plus a margin.
+# Consecutive daily misses required before concluding a ticker is actually delisted, not
+# just mid trading-halt - anchored to SEC Rule 12(k), which caps an ordinary trading
+# suspension at 10 business days, plus a margin.
 ZERO_STREAK_DELIST_THRESHOLD = 15
 # Once flagged delisted, how rarely to keep checking as a self-healing safety net (in case
 # the classification above was ever wrong) rather than stopping forever.
 DELISTED_RECHECK_DAYS = 30
 
 
-def get_ticker_price(conn: sqlite3.Connection, ticker: str) -> Optional[TickerPrice]:
-    row = conn.execute("SELECT * FROM ticker_prices WHERE ticker = ?", (ticker,)).fetchone()
-    return TickerPrice(**{k: row[k] for k in row.keys()}) if row else None
+def get_ticker_status(conn: sqlite3.Connection, ticker: str) -> Optional[TickerStatus]:
+    row = conn.execute("SELECT * FROM ticker_status WHERE ticker = ?", (ticker,)).fetchone()
+    return TickerStatus(**{k: row[k] for k in row.keys()}) if row else None
 
 
-def record_real_price(conn: sqlite3.Connection, ticker: str, price: float, checked_at: str, *, commit: bool = True) -> None:
-    """A real Finnhub quote came back - always wins over any prior zero-streak, whether
-    this is the ticker's first-ever price or a 'delisted' ticker unexpectedly trading again
-    during its monthly safety-net check. commit=False lets a caller batch many tickers'
-    writes into one round-trip instead of one per ticker."""
+def record_ticker_seen(conn: sqlite3.Connection, ticker: str, checked_at: str, *, commit: bool = True) -> None:
+    """A real price came back for this ticker this run (update_ticker_daily_prices.py) -
+    always wins over any prior zero-streak, whether this is the ticker's first-ever
+    successful check or a 'delisted' ticker unexpectedly trading again during its monthly
+    safety-net check. commit=False lets a caller batch many tickers' writes into one
+    round-trip instead of one per ticker."""
     conn.execute(
-        """INSERT INTO ticker_prices (ticker, current_price, price_updated_at, price_status, zero_streak, last_checked_at)
-           VALUES (?, ?, ?, 'active', 0, ?)
+        """INSERT INTO ticker_status (ticker, status, zero_streak, last_checked_at)
+           VALUES (?, 'active', 0, ?)
            ON CONFLICT (ticker) DO UPDATE SET
-               current_price = excluded.current_price,
-               price_updated_at = excluded.price_updated_at,
-               price_status = 'active',
+               status = 'active',
                zero_streak = 0,
                last_checked_at = excluded.last_checked_at""",
-        (ticker, price, checked_at, checked_at),
+        (ticker, checked_at),
     )
     if commit:
         conn.commit()
 
 
-def record_zero_response(conn: sqlite3.Connection, ticker: str, checked_at: str, *, commit: bool = True) -> None:
-    """Finnhub returned c == 0 (no data) - never overwrites current_price, which stays
-    frozen at its last real value (or NULL, if this ticker has never had one). Increments
-    the streak in one statement (no read-then-write race) and flips to 'delisted' once the
-    streak crosses ZERO_STREAK_DELIST_THRESHOLD. commit=False batches like record_real_price."""
+def record_ticker_missed(conn: sqlite3.Connection, ticker: str, checked_at: str, *, commit: bool = True) -> None:
+    """No usable price came back this run (update_ticker_daily_prices.py). Increments the
+    streak in one statement (no read-then-write race) and flips to 'delisted' once the
+    streak crosses ZERO_STREAK_DELIST_THRESHOLD. commit=False batches like
+    record_ticker_seen."""
     conn.execute(
-        """INSERT INTO ticker_prices (ticker, price_status, zero_streak, last_checked_at)
+        """INSERT INTO ticker_status (ticker, status, zero_streak, last_checked_at)
            VALUES (?, 'active', 1, ?)
            ON CONFLICT (ticker) DO UPDATE SET
-               zero_streak = ticker_prices.zero_streak + 1,
-               price_status = CASE WHEN ticker_prices.zero_streak + 1 >= ?
-                                    THEN 'delisted' ELSE ticker_prices.price_status END,
+               zero_streak = ticker_status.zero_streak + 1,
+               status = CASE WHEN ticker_status.zero_streak + 1 >= ?
+                              THEN 'delisted' ELSE ticker_status.status END,
                last_checked_at = excluded.last_checked_at""",
         (ticker, checked_at, ZERO_STREAK_DELIST_THRESHOLD),
     )
     if commit:
         conn.commit()
-
-
-def get_tickers_due_for_price_check(conn: sqlite3.Connection) -> list[str]:
-    """The daily trickle job's work queue: every ticker that has at least one real
-    historical price already on some trade (a ticker with zero price data anywhere is
-    already known-dead from the one-time backfill - Finnhub returning c=0 for it would be
-    known information, not worth spending quota to reconfirm), joined against ticker_prices
-    to skip 'delisted' tickers except on their once-a-month safety-net recheck. Ordered by
-    ticker so the trickle job's resume cursor (a bookmark by ticker value) is deterministic
-    across runs even as the underlying set of due tickers shifts."""
-    # priced_tickers is computed once (a single pass over trades) rather than as a
-    # correlated EXISTS re-evaluated per trade row - see PLAN.md.
-    rows = conn.execute(
-        f"""
-        WITH priced_tickers AS (
-            SELECT DISTINCT ticker FROM trades
-            WHERE ticker IS NOT NULL AND ticker != ''
-              AND (price_at_transaction IS NOT NULL OR price_at_notification IS NOT NULL
-                   OR price_30d IS NOT NULL OR price_90d IS NOT NULL
-                   OR price_180d IS NOT NULL OR price_365d IS NOT NULL)
-        )
-        SELECT pt.ticker FROM priced_tickers pt
-        LEFT JOIN ticker_prices tp ON tp.ticker = pt.ticker
-        WHERE tp.ticker IS NULL
-           OR tp.price_status = 'active'
-           OR (tp.price_status = 'delisted'
-               AND (tp.last_checked_at IS NULL
-                    OR julianday('now') - julianday(tp.last_checked_at) >= {DELISTED_RECHECK_DAYS}))
-        ORDER BY pt.ticker
-        """
-    ).fetchall()
-    return [row["ticker"] for row in rows]
-
-
-def get_trickle_cursor(conn: sqlite3.Connection) -> Optional[str]:
-    row = conn.execute("SELECT last_ticker FROM trickle_cursor WHERE id = 1").fetchone()
-    return row["last_ticker"] if row else None
-
-
-def set_trickle_cursor(conn: sqlite3.Connection, last_ticker: Optional[str]) -> None:
-    conn.execute(
-        """INSERT INTO trickle_cursor (id, last_ticker) VALUES (1, ?)
-           ON CONFLICT (id) DO UPDATE SET last_ticker = excluded.last_ticker""",
-        (last_ticker,),
-    )
-    conn.commit()
 
 
 def get_earliest_stock_trade_date(conn: sqlite3.Connection) -> Optional[str]:
@@ -710,36 +579,155 @@ def set_sector_benchmark_prices(
     conn.commit()
 
 
+def get_daily_price_backfill_cursor(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute("SELECT last_ticker FROM daily_price_backfill_cursor WHERE id = 1").fetchone()
+    return row["last_ticker"] if row else None
+
+
+def set_daily_price_backfill_cursor(conn: sqlite3.Connection, last_ticker: Optional[str]) -> None:
+    conn.execute(
+        """INSERT INTO daily_price_backfill_cursor (id, last_ticker) VALUES (1, ?)
+           ON CONFLICT (id) DO UPDATE SET last_ticker = excluded.last_ticker""",
+        (last_ticker,),
+    )
+    conn.commit()
+
+
+def get_all_traded_tickers(conn: sqlite3.Connection) -> list[str]:
+    """Every distinct ticker ever disclosed in a priceable (stock/option) trade - the
+    universe backfill_ticker_daily_prices.py works through. Sorted so the resume-cursor
+    comparison (ticker > cursor) in _rotate_to_resume_point-style logic is well-defined."""
+    rows = conn.execute(
+        """SELECT DISTINCT ticker FROM trades
+           WHERE ticker IS NOT NULL AND ticker != '' AND asset_type IN ('ST', 'Stock', 'OP')
+           ORDER BY ticker"""
+    ).fetchall()
+    return [r["ticker"] for r in rows]
+
+
+_TICKER_QUERY_BATCH_SIZE = 500
+
+
+def filter_active_or_recheckable(conn: sqlite3.Connection, tickers: list[str]) -> list[str]:
+    """Filters an arbitrary ticker list down to ones NOT currently 'delisted' in
+    ticker_status, except when their once-a-month safety-net recheck (DELISTED_RECHECK_DAYS)
+    is due. A ticker with no ticker_status row at all (never checked) always passes through."""
+    if not tickers:
+        return []
+    statuses: dict[str, tuple[str, Optional[str]]] = {}
+    for start in range(0, len(tickers), _TICKER_QUERY_BATCH_SIZE):
+        batch = tickers[start:start + _TICKER_QUERY_BATCH_SIZE]
+        placeholders = ",".join("?" * len(batch))
+        rows = conn.execute(
+            f"SELECT ticker, status, last_checked_at FROM ticker_status WHERE ticker IN ({placeholders})",
+            batch,
+        ).fetchall()
+        statuses.update({r["ticker"]: (r["status"], r["last_checked_at"]) for r in rows})
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    result = []
+    for ticker in tickers:
+        status = statuses.get(ticker)
+        if status is None:
+            result.append(ticker)
+            continue
+        ticker_status, last_checked_at = status
+        if ticker_status != "delisted":
+            result.append(ticker)
+            continue
+        if last_checked_at is None or (now - datetime.datetime.fromisoformat(last_checked_at)).days >= DELISTED_RECHECK_DAYS:
+            result.append(ticker)
+    return result
+
+
+def get_earliest_trade_dates_by_ticker(conn: sqlite3.Connection) -> dict[str, str]:
+    """Every traded ticker's own earliest transaction_date, in one query - the start date
+    backfill_ticker_daily_prices.py needs per ticker (each ticker's full history only goes
+    back as far as its own first disclosed trade, not some shared universe-wide date)."""
+    rows = conn.execute(
+        """SELECT ticker, MIN(transaction_date) AS d FROM trades
+           WHERE ticker IS NOT NULL AND ticker != '' AND asset_type IN ('ST', 'Stock', 'OP')
+           GROUP BY ticker"""
+    ).fetchall()
+    return {r["ticker"]: datetime.date.fromisoformat(r["d"]) for r in rows}
+
+
+def get_latest_daily_price_dates(conn: sqlite3.Connection, tickers: list[str]) -> dict[str, str]:
+    """Most recent date already stored in ticker_daily_prices for each of the given tickers -
+    a ticker absent from the result has no stored history yet (needs a full backfill, not an
+    incremental catch-up). Chunked to stay under SQLite/Turso's bound-parameter limit - the
+    full ticker universe here (~3,500) can exceed it in one IN (...) - same reasoning as
+    _refetch_by_id in sync_local_mirror.py."""
+    result: dict[str, str] = {}
+    for start in range(0, len(tickers), _TICKER_QUERY_BATCH_SIZE):
+        batch = tickers[start:start + _TICKER_QUERY_BATCH_SIZE]
+        placeholders = ",".join("?" * len(batch))
+        rows = conn.execute(
+            f"""SELECT ticker, MAX(date) AS d FROM ticker_daily_prices
+                WHERE ticker IN ({placeholders}) GROUP BY ticker""",
+            batch,
+        ).fetchall()
+        result.update({r["ticker"]: r["d"] for r in rows})
+    return result
+
+
+def get_ticker_daily_price(conn: sqlite3.Connection, ticker: str, date: str) -> Optional[float]:
+    """Single stored price lookup - used by the incremental catch-up to sanity-check a
+    freshly-fetched value against what's already on record for that same date (the
+    split-detection check - see update_ticker_daily_prices.py)."""
+    row = conn.execute(
+        "SELECT price FROM ticker_daily_prices WHERE ticker = ? AND date = ?", (ticker, date)
+    ).fetchone()
+    return row["price"] if row else None
+
+
+def set_ticker_daily_prices(
+    conn: sqlite3.Connection, ticker: str, prices: list[tuple[str, float]], *, commit: bool = True
+) -> None:
+    """Bulk-loads (date, price) pairs for one ticker into ticker_daily_prices.
+    commit=False lets a caller batch many tickers' writes into one round-trip instead of one
+    per ticker."""
+    for date, price in prices:
+        conn.execute(
+            """INSERT INTO ticker_daily_prices (ticker, date, price) VALUES (?, ?, ?)
+               ON CONFLICT (ticker, date) DO UPDATE SET price = excluded.price""",
+            (ticker, date, price),
+        )
+    if commit:
+        conn.commit()
+
+
+def replace_ticker_daily_prices(
+    conn: sqlite3.Connection, ticker: str, prices: list[tuple[str, float]], *, commit: bool = True
+) -> None:
+    """Wipes and rewrites one ticker's ENTIRE stored history - used only when the
+    incremental catch-up detects a split has moved the adjustment basis since the last
+    full fetch (see update_ticker_daily_prices.py's _needs_rebase). A plain upsert of just
+    the new window would otherwise leave the old rows on the pre-split basis forever."""
+    conn.execute("DELETE FROM ticker_daily_prices WHERE ticker = ?", (ticker,))
+    set_ticker_daily_prices(conn, ticker, prices, commit=commit)
+
+
 def backfill_delisted_status(conn: sqlite3.Connection) -> int:
-    """One-time labeling pass: gives every ticker with zero historical price data anywhere
-    (already excluded from get_tickers_due_for_price_check's queue by construction) an
-    explicit price_status='delisted' row instead of leaving it absent from ticker_prices -
-    absence reads as ambiguous ("confirmed dead" vs. "not checked yet") for downstream
-    analysis. zero_streak is set to the threshold for consistency, but last_checked_at
-    stays NULL since no Finnhub call happened - this comes from the historical backfill's
-    absence of data, a different source. Returns the count newly labeled."""
-    # Same fix as get_tickers_due_for_price_check: compute has-any-price per ticker in one
-    # grouped pass instead of a correlated EXISTS re-evaluated per trade row.
+    """One-time labeling pass: gives every ticker with zero rows in ticker_daily_prices an
+    explicit status='delisted' row instead of leaving it absent from ticker_status - absence
+    reads as ambiguous ("confirmed dead" vs. "not checked yet") for downstream analysis.
+    zero_streak is set to the threshold for consistency, but last_checked_at stays NULL since
+    no live check happened - this comes from the historical backfill's absence of data, a
+    different source. Returns the count newly labeled."""
     rows = conn.execute(
         """
-        WITH ticker_has_price AS (
-            SELECT ticker,
-                   MAX(price_at_transaction IS NOT NULL OR price_at_notification IS NOT NULL
-                       OR price_30d IS NOT NULL OR price_90d IS NOT NULL
-                       OR price_180d IS NOT NULL OR price_365d IS NOT NULL) AS has_price
-            FROM trades
-            WHERE ticker IS NOT NULL AND ticker != ''
-            GROUP BY ticker
-        )
-        SELECT ticker FROM ticker_has_price
-        WHERE has_price = 0 AND ticker NOT IN (SELECT ticker FROM ticker_prices)
+        SELECT DISTINCT t.ticker FROM trades t
+        WHERE t.ticker IS NOT NULL AND t.ticker != ''
+          AND NOT EXISTS (SELECT 1 FROM ticker_daily_prices tdp WHERE tdp.ticker = t.ticker)
+          AND NOT EXISTS (SELECT 1 FROM ticker_status ts WHERE ts.ticker = t.ticker)
         """
     ).fetchall()
     tickers = [row["ticker"] for row in rows]
     for ticker in tickers:
         conn.execute(
-            """INSERT INTO ticker_prices (ticker, current_price, price_updated_at, price_status, zero_streak, last_checked_at)
-               VALUES (?, NULL, NULL, 'delisted', ?, NULL)""",
+            """INSERT INTO ticker_status (ticker, status, zero_streak, last_checked_at)
+               VALUES (?, 'delisted', ?, NULL)""",
             (ticker, ZERO_STREAK_DELIST_THRESHOLD),
         )
     conn.commit()

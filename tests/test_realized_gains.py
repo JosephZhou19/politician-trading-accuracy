@@ -26,7 +26,9 @@ def _insert_trade(conn, legislator, ticker, *, transaction_type="purchase",
         owner="self",
     )
     if price_at_transaction is not None:
-        models.set_trade_prices(conn, trade_id, {"price_at_transaction": price_at_transaction})
+        # Price is now a property of (ticker, date), not the trade row - same convention as
+        # production's ticker_daily_prices.
+        models.set_ticker_daily_prices(conn, ticker, [(transaction_date, price_at_transaction)])
     return leg_id, trade_id
 
 
@@ -150,8 +152,12 @@ def test_tickers_and_legislators_do_not_share_lots(conn):
     _insert_trade(conn, ("Alan", "Armstrong"), "AAPL", transaction_type="sale_full",
                   price_at_transaction=30.0, transaction_date="2024-06-01")
 
+    # A different date than Armstrong's AAPL trades - ticker_daily_prices is keyed on
+    # (ticker, date), not per legislator, so two legislators trading the same ticker on the
+    # same real calendar day share one real price; a distinct date keeps this test's "clearly
+    # wrong if leaked" price (999.0) from colliding with Armstrong's own $10 AAPL price.
     other_leg, _ = _insert_trade(conn, ("Ben", "Cardin"), "AAPL", price_at_transaction=999.0,
-                                  transaction_date="2024-01-01")
+                                  transaction_date="2024-12-01")
 
     results = compute_realized_gains(conn)
     # Armstrong's AAPL sale must use AAPL's own $10 lot, unaffected by his open GOOG lot or
