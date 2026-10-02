@@ -583,6 +583,87 @@ def test_ticker_seen_resets_zero_streak(conn):
     assert ts.status == "active"
 
 
+def test_record_tickers_seen_batch_matches_individual_calls(conn):
+    for t in ("AAPL", "MSFT", "GOOG"):
+        _insert_trade(conn, t)
+        models.record_ticker_missed(conn, t, "2026-01-01T00:00:00Z")  # zero_streak=1 each
+
+    models.record_tickers_seen_batch(conn, ["AAPL", "MSFT", "GOOG"], "2026-01-02T00:00:00Z")
+
+    for t in ("AAPL", "MSFT", "GOOG"):
+        ts = models.get_ticker_status(conn, t)
+        assert ts.status == "active"
+        assert ts.zero_streak == 0
+        assert ts.last_checked_at == "2026-01-02T00:00:00Z"
+
+
+def test_record_tickers_seen_batch_empty_list_is_a_no_op(conn):
+    models.record_tickers_seen_batch(conn, [], "2026-01-01T00:00:00Z")  # must not raise
+
+
+def test_record_tickers_missed_batch_increments_each_independently(conn):
+    _insert_trade(conn, "AAPL")
+    _insert_trade(conn, "MSFT")
+    models.record_ticker_missed(conn, "AAPL", "2026-01-01T00:00:00Z")  # AAPL starts at 1
+
+    models.record_tickers_missed_batch(conn, ["AAPL", "MSFT"], "2026-01-02T00:00:00Z")
+
+    assert models.get_ticker_status(conn, "AAPL").zero_streak == 2
+    assert models.get_ticker_status(conn, "MSFT").zero_streak == 1
+
+
+def test_record_tickers_missed_batch_flips_to_delisted_at_threshold(conn):
+    _insert_trade(conn, "AAPL")
+    for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD - 1):
+        models.record_ticker_missed(conn, "AAPL", "2026-01-01T00:00:00Z")
+
+    models.record_tickers_missed_batch(conn, ["AAPL"], "2026-01-15T00:00:00Z")
+
+    ts = models.get_ticker_status(conn, "AAPL")
+    assert ts.status == "delisted"
+    assert ts.zero_streak == models.ZERO_STREAK_DELIST_THRESHOLD
+
+
+def test_record_tickers_missed_batch_empty_list_is_a_no_op(conn):
+    models.record_tickers_missed_batch(conn, [], "2026-01-01T00:00:00Z")  # must not raise
+
+
+def test_get_ticker_daily_prices_batch_returns_stored_prices(conn):
+    models.set_ticker_daily_prices(conn, "AAPL", [("2026-01-05", 100.0), ("2026-01-06", 101.0)])
+    models.set_ticker_daily_prices(conn, "MSFT", [("2026-01-05", 200.0)])
+
+    result = models.get_ticker_daily_prices_batch(conn, [("AAPL", "2026-01-05"), ("MSFT", "2026-01-05")])
+
+    assert result == {"AAPL": 100.0, "MSFT": 200.0}
+
+
+def test_get_ticker_daily_prices_batch_omits_missing_pairs(conn):
+    models.set_ticker_daily_prices(conn, "AAPL", [("2026-01-05", 100.0)])
+
+    # AAPL has no row on 01-06, and NODATA has no rows at all.
+    result = models.get_ticker_daily_prices_batch(conn, [("AAPL", "2026-01-06"), ("NODATA", "2026-01-05")])
+
+    assert result == {}
+
+
+def test_get_ticker_daily_prices_batch_handles_more_than_one_chunk(conn):
+    pairs = []
+    for i in range(90):
+        ticker = f"T{i}"
+        models.set_ticker_daily_prices(conn, ticker, [("2026-01-05", float(i))])
+        pairs.append((ticker, "2026-01-05"))
+
+    result = models.get_ticker_daily_prices_batch(conn, pairs)
+
+    assert len(result) == 90
+    assert result["T0"] == 0.0
+    assert result["T89"] == 89.0
+
+
+def test_get_ticker_daily_prices_batch_empty_list(conn):
+    assert models.get_ticker_daily_prices_batch(conn, []) == {}
+
+
 def test_delisted_ticker_is_excluded_until_recheck_window(conn):
     just_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     _insert_trade(conn, "AAPL")

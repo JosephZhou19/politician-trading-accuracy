@@ -41,6 +41,16 @@ No resumable cursor by design (unlike the two trickle-style jobs) - a run that h
 budget partway just leaves some tickers stale until the next scheduled run reprocesses the
 same small due-set from the top, which is cheap enough to be "insurance" rather than waste.
 
+Per-BATCH, not per-ticker, reads/writes within the due-tickers loop (fixed 2026-10-02):
+confirmed live that the previous per-ticker version (one rebase-check read, one status
+upsert, and one execute() per price row - all separate Turso round-trips, repeated for every
+single ticker) limited a full 30-minute run to clearing only ~94 of ~2,770 due tickers. The
+rebase-check read is now one batched query per group (get_ticker_daily_prices_batch), the
+price writes are one bulk multi-row insert per group (bulk_insert_ticker_daily_prices,
+already built for push_ticker_daily_prices_to_turso.py), and the ticker_status writes are one
+batched upsert per group per outcome (record_tickers_seen_batch/record_tickers_missed_batch) -
+collapsing roughly 250-300 round-trips per BATCH_SIZE-sized group down to about 4.
+
 Usage:
     python -m scripts.update_ticker_daily_prices --db data/congress_trades.db
 """
@@ -82,14 +92,13 @@ BATCH_DELAY_SECONDS = 1.0
 DEFAULT_TIME_BUDGET_MINUTES = 30
 
 
-def _needs_rebase(conn, ticker, last_stored_date, fetched_history):
+def _needs_rebase(stored, fresh):
     """True if the fetched window's price at the ticker's own last-stored date disagrees
-    with what's already on record there - see the module docstring's split-basis guard."""
-    stored = models.get_ticker_daily_price(conn, ticker, last_stored_date)
-    if stored is None:
-        return False
-    fresh = fetched_history.price_on_or_after(datetime.date.fromisoformat(last_stored_date))
-    if fresh is None:
+    with what's already on record there - see the module docstring's split-basis guard.
+    Takes the already-looked-up stored price and the already-computed fresh price directly
+    (not conn/ticker/history) - the caller batches the stored-price lookup across a whole
+    group of tickers in one round-trip now, instead of this function doing one per ticker."""
+    if stored is None or fresh is None:
         return False
     ratio = fresh / stored
     return not (1 / REBASE_RATIO_THRESHOLD <= ratio <= REBASE_RATIO_THRESHOLD)
@@ -148,29 +157,58 @@ def update_ticker_daily_prices(conn, time_budget_minutes=DEFAULT_TIME_BUDGET_MIN
         histories = fetch_ticker_histories_batch(batch, batch_start, today)
         time.sleep(BATCH_DELAY_SECONDS)
 
+        # One batched rebase-check read per group instead of one round-trip per ticker - see
+        # the module docstring for why.
+        priced = [t for t in batch if histories.get(t) is not None]
+        stored_prices = models.get_ticker_daily_prices_batch(conn, [(t, latest_dates[t]) for t in priced])
+
+        seen_tickers, missed_tickers, rebase_tickers = [], [], []
+        bulk_price_rows = []
+
         for ticker in batch:
             history = histories.get(ticker)
-            if history is None:
-                _record_outcome(conn, ticker, None, checked_at)
+            # Same condition _record_outcome uses: a non-None history whose window happened
+            # to filter down to zero valid days (every day NaN/implausible, without the whole
+            # ticker failing the batch fetch's own all-NaN check) is still a miss, not a
+            # successful (zero-row) "refresh".
+            if history is None or not history.daily_prices():
+                missed_tickers.append(ticker)
                 summary["tickers_no_data"] += 1
-                conn.commit()
                 continue
-            if _needs_rebase(conn, ticker, latest_dates[ticker], history):
-                full_history = fetch_ticker_history(ticker, earliest_by_ticker.get(ticker, today), today)
-                _record_outcome(conn, ticker, full_history, checked_at)
-                if full_history is not None:
-                    prices = [(date.isoformat(), price) for date, price in full_history.daily_prices()]
-                    models.replace_ticker_daily_prices(conn, ticker, prices, commit=False)
-                    summary["tickers_rebased"] += 1
-                    summary["days_written"] += len(prices)
-                conn.commit()
+
+            fresh = history.price_on_or_after(datetime.date.fromisoformat(latest_dates[ticker]))
+            if _needs_rebase(stored_prices.get(ticker), fresh):
+                rebase_tickers.append(ticker)
                 continue
-            _record_outcome(conn, ticker, history, checked_at)
+
+            seen_tickers.append(ticker)
             prices = [(date.isoformat(), price) for date, price in history.daily_prices()]
-            models.set_ticker_daily_prices(conn, ticker, prices, commit=False)
+            bulk_price_rows.extend((ticker, d, p) for d, p in prices)
             summary["due_tickers_refreshed"] += 1
             summary["days_written"] += len(prices)
-            conn.commit()
+
+        # One bulk multi-row insert for the whole group's price updates, instead of one
+        # execute() per row per ticker.
+        if bulk_price_rows:
+            models.bulk_insert_ticker_daily_prices(conn, bulk_price_rows)
+        if seen_tickers:
+            models.record_tickers_seen_batch(conn, seen_tickers, checked_at, commit=False)
+        if missed_tickers:
+            models.record_tickers_missed_batch(conn, missed_tickers, checked_at, commit=False)
+
+        # Rebases are rare (a real stock split since the last fetch) and still need an
+        # individual full refetch+replace - handled one at a time, but their status write
+        # still joins the single commit below instead of committing alone.
+        for ticker in rebase_tickers:
+            full_history = fetch_ticker_history(ticker, earliest_by_ticker.get(ticker, today), today)
+            _record_outcome(conn, ticker, full_history, checked_at)
+            if full_history is not None:
+                prices = [(date.isoformat(), price) for date, price in full_history.daily_prices()]
+                models.replace_ticker_daily_prices(conn, ticker, prices, commit=False)
+                summary["tickers_rebased"] += 1
+                summary["days_written"] += len(prices)
+
+        conn.commit()
 
         if deadline is not None and time.monotonic() >= deadline:
             print(f"Time budget reached after {start + len(batch)}/{len(due_tickers)} due "

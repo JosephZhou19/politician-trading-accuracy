@@ -511,8 +511,10 @@ def record_ticker_seen(conn: sqlite3.Connection, ticker: str, checked_at: str, *
     """A real price came back for this ticker this run (update_ticker_daily_prices.py) -
     always wins over any prior zero-streak, whether this is the ticker's first-ever
     successful check or a 'delisted' ticker unexpectedly trading again during its monthly
-    safety-net check. commit=False lets a caller batch many tickers' writes into one
-    round-trip instead of one per ticker."""
+    safety-net check. commit=False only defers the COMMIT, not the INSERT itself - against
+    Turso this is still its own network round-trip per call (same caveat
+    set_ticker_daily_prices already documents); for many tickers at once, use
+    record_tickers_seen_batch instead."""
     conn.execute(
         """INSERT INTO ticker_status (ticker, status, zero_streak, last_checked_at)
            VALUES (?, 'active', 0, ?)
@@ -529,8 +531,8 @@ def record_ticker_seen(conn: sqlite3.Connection, ticker: str, checked_at: str, *
 def record_ticker_missed(conn: sqlite3.Connection, ticker: str, checked_at: str, *, commit: bool = True) -> None:
     """No usable price came back this run (update_ticker_daily_prices.py). Increments the
     streak in one statement (no read-then-write race) and flips to 'delisted' once the
-    streak crosses ZERO_STREAK_DELIST_THRESHOLD. commit=False batches like
-    record_ticker_seen."""
+    streak crosses ZERO_STREAK_DELIST_THRESHOLD. Same round-trip caveat as record_ticker_seen
+    - for many tickers at once, use record_tickers_missed_batch instead."""
     conn.execute(
         """INSERT INTO ticker_status (ticker, status, zero_streak, last_checked_at)
            VALUES (?, 'active', 1, ?)
@@ -543,6 +545,72 @@ def record_ticker_missed(conn: sqlite3.Connection, ticker: str, checked_at: str,
     )
     if commit:
         conn.commit()
+
+
+def record_tickers_seen_batch(conn: sqlite3.Connection, tickers: list[str], checked_at: str, *, commit: bool = True) -> None:
+    """Same effect as calling record_ticker_seen once per ticker, but ONE multi-row upsert -
+    collapses N round-trips into 1. See update_ticker_daily_prices.py's module docstring for
+    the throughput problem this and its siblings below fix."""
+    if not tickers:
+        return
+    placeholders = ",".join("(?, 'active', 0, ?)" for _ in tickers)
+    params = [v for ticker in tickers for v in (ticker, checked_at)]
+    conn.execute(
+        f"""INSERT INTO ticker_status (ticker, status, zero_streak, last_checked_at)
+            VALUES {placeholders}
+            ON CONFLICT (ticker) DO UPDATE SET
+                status = 'active', zero_streak = 0, last_checked_at = excluded.last_checked_at""",
+        params,
+    )
+    if commit:
+        conn.commit()
+
+
+def record_tickers_missed_batch(conn: sqlite3.Connection, tickers: list[str], checked_at: str, *, commit: bool = True) -> None:
+    """Batched record_ticker_missed - see record_tickers_seen_batch. Each row's zero_streak
+    increment and delist check reference only that row's own prior value
+    (ticker_status.zero_streak), so this is semantically identical to N individual calls,
+    not just faster."""
+    if not tickers:
+        return
+    placeholders = ",".join("(?, 'active', 1, ?)" for _ in tickers)
+    params = [v for ticker in tickers for v in (ticker, checked_at)]
+    conn.execute(
+        f"""INSERT INTO ticker_status (ticker, status, zero_streak, last_checked_at)
+            VALUES {placeholders}
+            ON CONFLICT (ticker) DO UPDATE SET
+                zero_streak = ticker_status.zero_streak + 1,
+                status = CASE WHEN ticker_status.zero_streak + 1 >= ?
+                               THEN 'delisted' ELSE ticker_status.status END,
+                last_checked_at = excluded.last_checked_at""",
+        params + [ZERO_STREAK_DELIST_THRESHOLD],
+    )
+    if commit:
+        conn.commit()
+
+
+def get_ticker_daily_prices_batch(conn: sqlite3.Connection, ticker_dates: list[tuple[str, str]]) -> dict[str, float]:
+    """Batched get_ticker_daily_price - given [(ticker, date), ...], returns {ticker: price}
+    for whichever pairs have a stored row (a pair with none is simply absent, same contract
+    as the single-ticker version returning None). Collapses update_ticker_daily_prices.py's
+    per-ticker rebase-check read into one round-trip per batch. Chunked at the same
+    Turso-confirmed ~50-term compound-SELECT limit as get_latest_daily_price_dates."""
+    result: dict[str, float] = {}
+    for start in range(0, len(ticker_dates), _WATERMARK_QUERY_BATCH_SIZE):
+        batch = ticker_dates[start:start + _WATERMARK_QUERY_BATCH_SIZE]
+        subquery = " UNION ALL ".join(["SELECT ? AS ticker, ? AS d"] * len(batch))
+        params = [v for ticker, date in batch for v in (ticker, date)]
+        rows = conn.execute(
+            f"""
+            SELECT w.ticker, tdp.price FROM ({subquery}) w
+            LEFT JOIN ticker_daily_prices tdp ON tdp.ticker = w.ticker AND tdp.date = w.d
+            """,
+            params,
+        ).fetchall()
+        for row in rows:
+            if row["price"] is not None:
+                result[row["ticker"]] = row["price"]
+    return result
 
 
 def get_earliest_stock_trade_date(conn: sqlite3.Connection) -> Optional[str]:

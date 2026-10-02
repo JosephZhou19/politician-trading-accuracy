@@ -188,3 +188,63 @@ def test_no_data_for_a_due_ticker_increments_zero_streak(conn):
 
     ts = models.get_ticker_status(conn, "AAPL")
     assert ts.zero_streak == 1
+
+
+def test_a_history_with_zero_valid_daily_prices_counts_as_a_miss_not_a_refresh(conn):
+    """A non-None history whose window happened to filter down to zero valid days (e.g. every
+    day NaN/implausible, without the whole ticker failing the batch fetch's own all-NaN check)
+    must still be treated as a miss - not counted as due_tickers_refreshed, and must not reset
+    the ticker's zero_streak to 0."""
+    _insert_trade(conn, "AAPL", "2020-01-05")
+    models.set_ticker_daily_prices(conn, "AAPL", [("2026-09-10", 200.0)])
+    models.record_ticker_missed(conn, "AAPL", "2026-09-09T00:00:00+00:00")  # zero_streak=1 already
+
+    empty_history = TickerHistory("AAPL", pd.Series([], dtype=float, index=pd.DatetimeIndex([]).date))
+    with patch(
+        "scripts.update_ticker_daily_prices.fetch_ticker_histories_batch", return_value={"AAPL": empty_history}
+    ):
+        summary = update_ticker_daily_prices(conn)
+
+    assert summary["due_tickers_refreshed"] == 0
+    assert summary["tickers_no_data"] == 1
+    ts = models.get_ticker_status(conn, "AAPL")
+    assert ts.zero_streak == 2  # incremented, not reset to 0
+
+
+def test_due_tickers_batch_uses_a_bounded_number_of_round_trips_not_one_per_ticker(conn):
+    """The actual regression this fix is for: confirmed live that the old per-ticker version
+    took ~5-6 Turso round-trips PER due ticker (one rebase-check read, one status upsert, one
+    execute() per price row), limiting a 30-minute run to ~94 of ~2,770 due tickers. A batch
+    of 20 due tickers must now cost a small, roughly-constant number of conn.execute() calls
+    - not one that scales with the ticker count."""
+    n = 20
+    tickers = [f"T{i}" for i in range(n)]
+    for t in tickers:
+        _insert_trade(conn, t, "2020-01-05")
+        models.set_ticker_daily_prices(conn, t, [("2026-09-10", 100.0)])
+        models.record_ticker_seen(conn, t, "2026-09-10T00:00:00+00:00")
+
+    histories = {t: _fake_history([("2026-09-10", 100.0), ("2026-09-15", 105.0)]) for t in tickers}
+
+    statement_count = 0
+
+    def _count(sql):
+        nonlocal statement_count
+        statement_count += 1
+
+    conn.set_trace_callback(_count)
+    try:
+        with patch(
+            "scripts.update_ticker_daily_prices.fetch_ticker_histories_batch", return_value=histories
+        ):
+            summary = update_ticker_daily_prices(conn)
+    finally:
+        conn.set_trace_callback(None)
+
+    assert summary["due_tickers_refreshed"] == n
+    # A handful of statements for the whole 20-ticker batch (rebase-check read, bulk price
+    # insert, status upsert, plus the run's own setup queries and transaction control) -
+    # nowhere near 20x anything, and specifically far below what one-round-trip-per-ticker
+    # would require (20+ statements for just the price writes alone, before even counting
+    # the rebase/status round trips).
+    assert statement_count < 20
