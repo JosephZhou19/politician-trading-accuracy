@@ -615,6 +615,41 @@ def test_delisted_ticker_that_trades_again_reactivates(conn):
     assert models.filter_active_or_recheckable(conn, ["AAPL"]) == ["AAPL"]
 
 
+def test_get_latest_daily_price_dates_returns_the_max_date_per_ticker(conn):
+    models.set_ticker_daily_prices(conn, "AAPL", [("2026-01-02", 100.0), ("2026-01-05", 101.0)])
+    models.set_ticker_daily_prices(conn, "MSFT", [("2026-01-03", 200.0)])
+
+    result = models.get_latest_daily_price_dates(conn, ["AAPL", "MSFT"])
+
+    assert result == {"AAPL": "2026-01-05", "MSFT": "2026-01-03"}
+
+
+def test_get_latest_daily_price_dates_omits_tickers_with_no_rows(conn):
+    models.set_ticker_daily_prices(conn, "AAPL", [("2026-01-02", 100.0)])
+
+    result = models.get_latest_daily_price_dates(conn, ["AAPL", "NODATA"])
+
+    assert result == {"AAPL": "2026-01-02"}
+    assert "NODATA" not in result
+
+
+def test_get_latest_daily_price_dates_handles_a_batch_larger_than_the_compound_select_limit(conn):
+    """Must not hit Turso's real ~50-term compound-SELECT limit - exercises a batch bigger
+    than _WATERMARK_QUERY_BATCH_SIZE to confirm the chunking loop actually kicks in."""
+    tickers = [f"T{i}" for i in range(90)]
+    for t in tickers:
+        models.set_ticker_daily_prices(conn, t, [("2026-01-01", 1.0)])
+
+    result = models.get_latest_daily_price_dates(conn, tickers)
+
+    assert len(result) == 90
+    assert all(v == "2026-01-01" for v in result.values())
+
+
+def test_get_latest_daily_price_dates_empty_ticker_list(conn):
+    assert models.get_latest_daily_price_dates(conn, []) == {}
+
+
 def test_backfill_delisted_status_labels_only_tickers_with_zero_daily_price_history(conn):
     _insert_trade(conn, "AAPL")
     models.set_ticker_daily_prices(conn, "AAPL", [("2026-01-05", 100.0)])
@@ -650,6 +685,54 @@ def test_backfill_delisted_status_skips_ticker_already_tracked_as_active(conn):
     models.backfill_delisted_status(conn)
 
     assert models.get_ticker_status(conn, "DEADCO").status == "active"
+
+
+def test_fast_forward_confirmed_dead_tickers_relabels_an_already_tracked_zero_row_ticker(conn):
+    """The exact case backfill_delisted_status refuses to touch: already has a ticker_status
+    row (from a real prior check), still zero rows in ticker_daily_prices."""
+    _insert_trade(conn, "DEADCO")
+    models.record_ticker_missed(conn, "DEADCO", "2026-01-01T00:00:00Z")  # zero_streak=1, still 'active'
+
+    count = models.fast_forward_confirmed_dead_tickers(conn, "2026-02-01T00:00:00Z")
+
+    assert count == 1
+    status = models.get_ticker_status(conn, "DEADCO")
+    assert status.status == "delisted"
+    assert status.zero_streak == models.ZERO_STREAK_DELIST_THRESHOLD
+    assert status.last_checked_at == "2026-02-01T00:00:00Z"  # updated, unlike backfill_delisted_status
+
+
+def test_fast_forward_confirmed_dead_tickers_skips_tickers_with_real_price_history(conn):
+    _insert_trade(conn, "AAPL")
+    models.set_ticker_daily_prices(conn, "AAPL", [("2026-01-05", 100.0)])
+    models.record_ticker_seen(conn, "AAPL", "2026-01-05T00:00:00Z")
+
+    count = models.fast_forward_confirmed_dead_tickers(conn, "2026-02-01T00:00:00Z")
+
+    assert count == 0
+    assert models.get_ticker_status(conn, "AAPL").status == "active"
+
+
+def test_fast_forward_confirmed_dead_tickers_skips_tickers_with_no_status_row_at_all(conn):
+    """A never-checked ticker (no ticker_status row) is backfill_delisted_status's job, not
+    this one - this function only ever acts on tickers already marked 'active'."""
+    _insert_trade(conn, "BRANDNEW")
+
+    count = models.fast_forward_confirmed_dead_tickers(conn, "2026-02-01T00:00:00Z")
+
+    assert count == 0
+    assert models.get_ticker_status(conn, "BRANDNEW") is None
+
+
+def test_fast_forward_confirmed_dead_tickers_skips_already_delisted(conn):
+    _insert_trade(conn, "DEADCO")
+    for _ in range(models.ZERO_STREAK_DELIST_THRESHOLD):
+        models.record_ticker_missed(conn, "DEADCO", "2026-01-01T00:00:00Z")
+    assert models.get_ticker_status(conn, "DEADCO").status == "delisted"
+
+    count = models.fast_forward_confirmed_dead_tickers(conn, "2026-02-01T00:00:00Z")
+
+    assert count == 0  # already delisted - nothing to fast-forward
 
 
 def test_daily_price_backfill_cursor_round_trip(conn):

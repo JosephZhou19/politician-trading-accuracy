@@ -669,22 +669,42 @@ def get_earliest_trade_dates_by_ticker(conn: sqlite3.Connection) -> dict[str, st
     return {r["ticker"]: datetime.date.fromisoformat(r["d"]) for r in rows}
 
 
+# Confirmed live against production Turso (2026-10-01): a plain `GROUP BY ticker` /
+# `MAX(date)` over an IN-list does NOT get SQLite's cheap single-seek-per-group optimization
+# here - it reads a real chunk of each ticker's own row range to compute the max, confirmed
+# via direct timing (500 heavily-populated tickers, 1.66M underlying rows: 273.7ms for the
+# GROUP BY form vs 5.0ms, 55x faster, for the per-ticker correlated-subquery form below).
+# Traced a ~5M-row-read day directly to this: ~2,769 due tickers x ~1,550 avg rows/ticker is
+# right in that range, and this function runs on every single trickle job invocation. A
+# smaller batch size than _TICKER_QUERY_BATCH_SIZE is required here specifically because this
+# query shape uses a UNION-ALL subquery, which hits Turso's real (empirically confirmed
+# elsewhere this session, in sync_local_mirror.py) ~50-term compound-SELECT limit - the plain
+# `IN (...)` queries elsewhere in this file aren't compound SELECTs and don't have this limit.
+_WATERMARK_QUERY_BATCH_SIZE = 40
+
+
 def get_latest_daily_price_dates(conn: sqlite3.Connection, tickers: list[str]) -> dict[str, str]:
     """Most recent date already stored in ticker_daily_prices for each of the given tickers -
     a ticker absent from the result has no stored history yet (needs a full backfill, not an
-    incremental catch-up). Chunked to stay under SQLite/Turso's bound-parameter limit - the
-    full ticker universe here (~3,500) can exceed it in one IN (...) - same reasoning as
-    _refetch_by_id in sync_local_mirror.py."""
+    incremental catch-up). Chunked (see _WATERMARK_QUERY_BATCH_SIZE) both to stay under
+    Turso's compound-SELECT term limit and to keep each round-trip's row cost small."""
     result: dict[str, str] = {}
-    for start in range(0, len(tickers), _TICKER_QUERY_BATCH_SIZE):
-        batch = tickers[start:start + _TICKER_QUERY_BATCH_SIZE]
-        placeholders = ",".join("?" * len(batch))
+    for start in range(0, len(tickers), _WATERMARK_QUERY_BATCH_SIZE):
+        batch = tickers[start:start + _WATERMARK_QUERY_BATCH_SIZE]
+        subquery = " UNION ALL ".join(["SELECT ? AS ticker"] * len(batch))
         rows = conn.execute(
-            f"""SELECT ticker, MAX(date) AS d FROM ticker_daily_prices
-                WHERE ticker IN ({placeholders}) GROUP BY ticker""",
+            f"""
+            SELECT w.ticker, (
+                SELECT tdp.date FROM ticker_daily_prices tdp
+                WHERE tdp.ticker = w.ticker ORDER BY tdp.date DESC LIMIT 1
+            ) AS d
+            FROM ({subquery}) w
+            """,
             batch,
         ).fetchall()
-        result.update({r["ticker"]: r["d"] for r in rows})
+        for row in rows:
+            if row["d"] is not None:
+                result[row["ticker"]] = row["d"]
     return result
 
 
@@ -771,6 +791,38 @@ def backfill_delisted_status(conn: sqlite3.Connection) -> int:
             """INSERT INTO ticker_status (ticker, status, zero_streak, last_checked_at)
                VALUES (?, 'delisted', ?, NULL)""",
             (ticker, ZERO_STREAK_DELIST_THRESHOLD),
+        )
+    conn.commit()
+    return len(tickers)
+
+
+def fast_forward_confirmed_dead_tickers(conn: sqlite3.Connection, checked_at: str) -> int:
+    """Companion to backfill_delisted_status, for the case that function deliberately
+    refuses to touch: a ticker ALREADY tracked in ticker_status (status='active', meaning
+    update_ticker_daily_prices.py has called record_ticker_missed on it at least once) that
+    STILL has zero rows in ticker_daily_prices. Left alone, such a ticker keeps getting
+    reprocessed through the unthrottled "new tickers" pass every single run until its own
+    zero_streak naturally crosses ZERO_STREAK_DELIST_THRESHOLD (~15 runs) - confirmed live
+    this session: a multi-day pause meant only 2-3 real runs had happened, so ~713 tickers
+    already independently confirmed dead (via the one-time backfill plus its
+    stockanalysis.com fallback) were still sitting at zero_streak 0-2, each burning a yfinance
+    call and a Turso write every run for no benefit. This fast-forwards them straight to
+    'delisted' instead of waiting out the natural streak. Unlike backfill_delisted_status,
+    last_checked_at IS updated to the given checked_at (a real check already happened,
+    repeatedly - this isn't filling in absent history). Returns the count fast-forwarded."""
+    rows = conn.execute(
+        """
+        SELECT ts.ticker FROM ticker_status ts
+        WHERE ts.status = 'active'
+          AND NOT EXISTS (SELECT 1 FROM ticker_daily_prices tdp WHERE tdp.ticker = ts.ticker)
+        """
+    ).fetchall()
+    tickers = [row["ticker"] for row in rows]
+    for ticker in tickers:
+        conn.execute(
+            """UPDATE ticker_status SET status = 'delisted', zero_streak = ?, last_checked_at = ?
+               WHERE ticker = ?""",
+            (ZERO_STREAK_DELIST_THRESHOLD, checked_at, ticker),
         )
     conn.commit()
     return len(tickers)
