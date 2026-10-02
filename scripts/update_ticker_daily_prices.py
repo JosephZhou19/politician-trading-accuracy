@@ -14,18 +14,19 @@ as its own value anywhere (it's just the latest row in ticker_daily_prices now).
 Two ticker groups, handled differently:
 - Tickers with NO stored history yet (a newly-disclosed ticker the one-time backfill hasn't
   reached, or hasn't started on at all) get a full single-ticker fetch_ticker_history call,
-  same as the one-time backfill - rare per run, so sequential calls here are fine.
+  same as the one-time backfill - rare per run, so sequential FETCHES here are fine; the
+  resulting writes are still batched (see below), not one round-trip per ticker.
 - Tickers that already have stored history are batched together (BATCH_SIZE per yfinance
   call via fetch_ticker_histories_batch) and only asked for a small recent OVERLAP_DAYS
   window, not their whole history - this is what keeps a run of ~3,500 tickers down to
   roughly 3,500/BATCH_SIZE yfinance requests instead of 3,500 individual ones.
 
 OVERLAP_DAYS is deliberately small (see its own comment) - every day in the fetched window
-gets re-upserted via set_ticker_daily_prices on every run, not just genuinely new days, so
-this number multiplies directly into Turso write volume across ~2,500+ due tickers, every
-run. Confirmed live this session: at the old value (10 calendar days, ~7 trading days),
-that was ~18,000 redundant row-writes/run for corrections we have no actual evidence occur
-at that range - see OVERLAP_DAYS's own comment for what we DO have evidence of.
+gets re-upserted on every run, not just genuinely new days, so this number multiplies
+directly into Turso write volume across ~2,500+ due tickers, every run. Confirmed live this
+session: at the old value (10 calendar days, ~7 trading days), that was ~18,000 redundant
+row-writes/run for corrections we have no actual evidence occur at that range - see
+OVERLAP_DAYS's own comment for what we DO have evidence of.
 
 Split-basis guard: before upserting a "due" ticker's fetched window, its fetched price at
 its own last-already-stored date is compared against what's on record for that date (see
@@ -41,15 +42,17 @@ No resumable cursor by design (unlike the two trickle-style jobs) - a run that h
 budget partway just leaves some tickers stale until the next scheduled run reprocesses the
 same small due-set from the top, which is cheap enough to be "insurance" rather than waste.
 
-Per-BATCH, not per-ticker, reads/writes within the due-tickers loop (fixed 2026-10-02):
-confirmed live that the previous per-ticker version (one rebase-check read, one status
-upsert, and one execute() per price row - all separate Turso round-trips, repeated for every
-single ticker) limited a full 30-minute run to clearing only ~94 of ~2,770 due tickers. The
-rebase-check read is now one batched query per group (get_ticker_daily_prices_batch), the
-price writes are one bulk multi-row insert per group (bulk_insert_ticker_daily_prices,
-already built for push_ticker_daily_prices_to_turso.py), and the ticker_status writes are one
-batched upsert per group per outcome (record_tickers_seen_batch/record_tickers_missed_batch) -
-collapsing roughly 250-300 round-trips per BATCH_SIZE-sized group down to about 4.
+Per-BATCH, not per-ticker, reads/writes (fixed 2026-10-02): confirmed live that the previous
+per-ticker version (one rebase-check read, one status upsert, and one execute() per price row
+- all separate Turso round-trips, repeated for every single ticker) limited a full 30-minute
+run to clearing only ~94 of ~2,770 due tickers. Applies to all three paths now: the due-tickers
+loop (rebase-check read batched via get_ticker_daily_prices_batch, price writes via
+bulk_insert_ticker_daily_prices, status writes via record_tickers_seen_batch/
+record_tickers_missed_batch), the new-tickers loop (same batched writes, flushed every
+BATCH_SIZE tickers), and a rebase's full-history replace (replace_ticker_daily_prices now
+uses the same bulk insert internally instead of one execute() per row).
+fast_forward_confirmed_dead_tickers runs once up front so a ticker already independently
+confirmed dead doesn't keep cycling through the new-tickers pass every run.
 
 Usage:
     python -m scripts.update_ticker_daily_prices --db data/congress_trades.db
@@ -117,6 +120,15 @@ def _record_outcome(conn, ticker, history, checked_at):
 def update_ticker_daily_prices(conn, time_budget_minutes=DEFAULT_TIME_BUDGET_MINUTES):
     today = datetime.date.today()
     checked_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # Tickers already tracked 'active' in ticker_status but with zero stored rows otherwise
+    # sit in the new-tickers pass every run until their own zero_streak naturally crosses the
+    # delist threshold - fast-forward ones already independently confirmed dead so they stop
+    # burning a fetch+write each run.
+    fast_forwarded = models.fast_forward_confirmed_dead_tickers(conn, checked_at)
+    if fast_forwarded:
+        print(f"Fast-forwarded {fast_forwarded} already-confirmed-dead ticker(s) to 'delisted'.")
+
     # Every traded ticker, minus ones confirmed 'delisted' except their once-a-month
     # safety-net recheck.
     all_tickers = models.filter_active_or_recheckable(conn, models.get_all_traded_tickers(conn))
@@ -134,20 +146,45 @@ def update_ticker_daily_prices(conn, time_budget_minutes=DEFAULT_TIME_BUDGET_MIN
           f"{len(due_tickers)} already-tracked ticker(s) due for a catch-up.")
 
     earliest_by_ticker = models.get_earliest_trade_dates_by_ticker(conn)
+
+    # Each new ticker still needs its own individual fetch (a different full-history start
+    # date per ticker), but the writes are batched in groups of BATCH_SIZE instead of one
+    # execute() + commit() per ticker - same round-trip-collapsing fix as the due-tickers loop.
+    new_seen, new_missed, new_bulk_rows = [], [], []
+
+    def _flush_new_tickers():
+        if new_bulk_rows:
+            models.bulk_insert_ticker_daily_prices(conn, new_bulk_rows, commit=False)
+        if new_seen:
+            models.record_tickers_seen_batch(conn, new_seen, checked_at, commit=False)
+        if new_missed:
+            models.record_tickers_missed_batch(conn, new_missed, checked_at, commit=False)
+        conn.commit()
+        new_seen.clear()
+        new_missed.clear()
+        new_bulk_rows.clear()
+
     for ticker in new_tickers:
         history = fetch_ticker_history(ticker, earliest_by_ticker.get(ticker, today), today)
-        _record_outcome(conn, ticker, history, checked_at)
-        if history is None:
+        if history is None or not history.daily_prices():
+            new_missed.append(ticker)
             summary["tickers_no_data"] += 1
         else:
             prices = [(date.isoformat(), price) for date, price in history.daily_prices()]
-            models.set_ticker_daily_prices(conn, ticker, prices, commit=False)
+            new_bulk_rows.extend((ticker, d, p) for d, p in prices)
+            new_seen.append(ticker)
             summary["new_tickers_backfilled"] += 1
             summary["days_written"] += len(prices)
-        conn.commit()
+
+        if len(new_seen) + len(new_missed) >= BATCH_SIZE:
+            _flush_new_tickers()
+
         if deadline is not None and time.monotonic() >= deadline:
+            _flush_new_tickers()
             print("Time budget reached during new-ticker pass - stopping early.")
             return summary
+
+    _flush_new_tickers()
 
     for start in range(0, len(due_tickers), BATCH_SIZE):
         batch = due_tickers[start:start + BATCH_SIZE]
@@ -182,7 +219,14 @@ def update_ticker_daily_prices(conn, time_budget_minutes=DEFAULT_TIME_BUDGET_MIN
                 continue
 
             seen_tickers.append(ticker)
-            prices = [(date.isoformat(), price) for date, price in history.daily_prices()]
+            # batch_start is the MIN watermark across the whole batch; writing a ticker's full
+            # fetched window (instead of just its own overlap) let one stale batch-mate drag
+            # everyone else into writing years of redundant rows - confirmed live, 19.7x
+            # amplification (1.17M rows vs. ~95k). Filter to this ticker's own watermark.
+            own_start = datetime.date.fromisoformat(latest_dates[ticker]) - datetime.timedelta(days=OVERLAP_DAYS)
+            prices = [
+                (date.isoformat(), price) for date, price in history.daily_prices() if date >= own_start
+            ]
             bulk_price_rows.extend((ticker, d, p) for d, p in prices)
             summary["due_tickers_refreshed"] += 1
             summary["days_written"] += len(prices)

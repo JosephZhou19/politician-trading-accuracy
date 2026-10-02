@@ -96,6 +96,35 @@ def test_due_ticker_batch_start_date_uses_the_earliest_overlap_window_in_the_bat
     assert called_start == datetime.date(2026, 9, 1) - datetime.timedelta(days=OVERLAP_DAYS)
 
 
+def test_a_stale_batchmate_does_not_inflate_another_tickers_written_rows(conn):
+    """Regression for a real, confirmed-live bug: batch_start is the MIN watermark across the
+    whole batch, so a stale ticker (AAPL, watermark from years back) makes the shared fetch
+    window span years - but MSFT (watermark just a few days old) must still only get ITS OWN
+    overlap window written, not AAPL's entire multi-year gap. Measured live: this fix cut a
+    real run's days_written from 1,178,033 to a small fraction of that."""
+    _insert_trade(conn, "AAPL", "2020-01-05")
+    _insert_trade(conn, "MSFT", "2020-01-05")
+    models.set_ticker_daily_prices(conn, "AAPL", [("2019-01-01", 1.0)])   # very stale
+    models.set_ticker_daily_prices(conn, "MSFT", [("2026-09-08", 2.0)])  # nearly current
+
+    # The shared batch fetch spans from AAPL's stale watermark all the way to today, for BOTH
+    # tickers - that's the pre-existing, unavoidable fetch-side behavior this test isn't
+    # about; what matters is what gets WRITTEN afterward.
+    wide_range = [("2019-01-01", 1.0), ("2022-06-15", 1.5), ("2026-09-08", 2.0), ("2026-09-10", 2.1)]
+    with patch(
+        "scripts.update_ticker_daily_prices.fetch_ticker_histories_batch",
+        return_value={"AAPL": _fake_history(wide_range), "MSFT": _fake_history(wide_range)},
+    ):
+        update_ticker_daily_prices(conn)
+
+    msft_rows = conn.execute(
+        "SELECT date FROM ticker_daily_prices WHERE ticker = 'MSFT' ORDER BY date"
+    ).fetchall()
+    # MSFT's own watermark is 2026-09-08, OVERLAP_DAYS=2 back is 2026-09-06 - only dates on or
+    # after that should be written, never AAPL's 2019/2022 history.
+    assert [r["date"] for r in msft_rows] == ["2026-09-08", "2026-09-10"]
+
+
 def test_split_detected_triggers_full_refetch_and_replace(conn):
     """The batch window's fetched price at the ticker's own last-stored date disagrees with
     what's on record there by more than the rebase threshold - a split must have moved the
@@ -145,6 +174,22 @@ def test_missing_history_from_batch_counts_as_no_data(conn):
         summary = update_ticker_daily_prices(conn)
 
     assert summary["tickers_no_data"] == 1
+
+
+def test_a_confirmed_dead_ticker_is_fast_forwarded_and_not_reprocessed(conn):
+    """A ticker already tracked 'active' in ticker_status but with zero stored rows
+    (independently confirmed dead by the one-time backfill) must be fast-forwarded to
+    'delisted' up front, so it's filtered out of this run's new-tickers pass instead of
+    burning another fetch+write on a ticker already known to be gone."""
+    _insert_trade(conn, "DEADCO", "2020-01-05")
+    models.record_ticker_seen(conn, "DEADCO", "2026-01-01T00:00:00+00:00")  # active, zero price rows
+
+    with patch("scripts.update_ticker_daily_prices.fetch_ticker_history") as mock_fetch:
+        update_ticker_daily_prices(conn)
+
+    mock_fetch.assert_not_called()
+    ts = models.get_ticker_status(conn, "DEADCO")
+    assert ts.status == "delisted"
 
 
 def test_replaces_the_old_finnhub_trickle_by_syncing_ticker_status(conn):
@@ -209,6 +254,83 @@ def test_a_history_with_zero_valid_daily_prices_counts_as_a_miss_not_a_refresh(c
     assert summary["tickers_no_data"] == 1
     ts = models.get_ticker_status(conn, "AAPL")
     assert ts.zero_streak == 2  # incremented, not reset to 0
+
+
+def test_new_tickers_batch_uses_a_bounded_number_of_round_trips_not_one_per_ticker(conn):
+    """Same fix extended to the new-tickers loop: it previously did one execute() per price
+    row plus a separate status upsert and commit() per ticker. Writes across a group of new
+    tickers must now be batched, not scale with ticker count."""
+    n = 20
+    tickers = [f"N{i}" for i in range(n)]
+    for t in tickers:
+        _insert_trade(conn, t, "2020-01-05")
+
+    def _fetch_one(ticker, start, end):
+        return _fake_history([("2020-01-05", 100.0), ("2020-01-06", 101.0)])
+
+    statement_count = 0
+
+    def _count(sql):
+        nonlocal statement_count
+        statement_count += 1
+
+    conn.set_trace_callback(_count)
+    try:
+        with patch("scripts.update_ticker_daily_prices.fetch_ticker_history", side_effect=_fetch_one):
+            summary = update_ticker_daily_prices(conn)
+    finally:
+        conn.set_trace_callback(None)
+
+    assert summary["new_tickers_backfilled"] == n
+    assert statement_count < 20
+
+
+def test_new_tickers_flush_in_groups_not_only_at_the_very_end(conn):
+    """A run that hits its time budget partway through the new-tickers pass must not lose
+    the writes it already fetched but hadn't flushed yet."""
+    tickers = [f"N{i}" for i in range(3)]
+    for t in tickers:
+        _insert_trade(conn, t, "2020-01-05")
+
+    call_count = 0
+
+    def _fetch_one(ticker, start, end):
+        nonlocal call_count
+        call_count += 1
+        return _fake_history([("2020-01-05", float(call_count))])
+
+    with patch("scripts.update_ticker_daily_prices.fetch_ticker_history", side_effect=_fetch_one), \
+         patch("scripts.update_ticker_daily_prices.time.monotonic", side_effect=[0] + [1000] * 10):
+        summary = update_ticker_daily_prices(conn, time_budget_minutes=1)
+
+    assert summary["new_tickers_backfilled"] == 1
+    rows = conn.execute("SELECT ticker FROM ticker_daily_prices").fetchall()
+    assert [r["ticker"] for r in rows] == ["N0"]
+
+
+def test_rebase_replace_uses_the_bulk_insert_path_not_one_execute_per_row(conn):
+    """replace_ticker_daily_prices (the rebase path) must route through the same bulk insert
+    as everything else, not set_ticker_daily_prices's per-row loop - a rebase can be years of
+    history, not a handful of rows."""
+    _insert_trade(conn, "AAPL", "2020-01-05")
+    models.set_ticker_daily_prices(conn, "AAPL", [("2020-01-05", 100.0), ("2026-09-10", 400.0)])
+
+    fresh = _fake_history([("2026-09-01", 98.0), ("2026-09-10", 100.0)])
+    full_post_split = _fake_history([("2020-01-05", 25.0), ("2026-09-10", 100.0)])
+
+    with patch(
+        "scripts.update_ticker_daily_prices.fetch_ticker_histories_batch", return_value={"AAPL": fresh}
+    ), patch(
+        "scripts.update_ticker_daily_prices.fetch_ticker_history", return_value=full_post_split
+    ), patch(
+        "src.db.models.bulk_insert_ticker_daily_prices", wraps=models.bulk_insert_ticker_daily_prices
+    ) as mock_bulk, patch(
+        "src.db.models.set_ticker_daily_prices", wraps=models.set_ticker_daily_prices
+    ) as mock_single:
+        update_ticker_daily_prices(conn)
+
+    mock_bulk.assert_called_once()
+    mock_single.assert_not_called()
 
 
 def test_due_tickers_batch_uses_a_bounded_number_of_round_trips_not_one_per_ticker(conn):

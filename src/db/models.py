@@ -790,12 +790,10 @@ def set_ticker_daily_prices(
     conn: sqlite3.Connection, ticker: str, prices: list[tuple[str, float]], *, commit: bool = True
 ) -> None:
     """Loads (date, price) pairs for one ticker into ticker_daily_prices, one execute() per
-    row - fine for the recurring incremental catch-up's small windows (a handful of rows per
-    ticker), but NOT a reduced-round-trip bulk path: against Turso, each row is still its own
-    network round-trip regardless of commit=False (which only defers the COMMIT, not the
-    INSERTs themselves). For loading many rows across many tickers at once, use
-    bulk_insert_ticker_daily_prices instead. commit=False lets a caller share one commit
-    across several tickers' worth of calls."""
+    row - against Turso, each row is its own network round-trip regardless of commit=False
+    (which only defers the COMMIT, not the INSERTs themselves). Only fine for the one-time
+    full backfill's per-ticker loop (backfill_ticker_daily_prices.py); for loading many rows
+    across many tickers at once, use bulk_insert_ticker_daily_prices instead."""
     for date, price in prices:
         conn.execute(
             """INSERT INTO ticker_daily_prices (ticker, date, price) VALUES (?, ?, ?)
@@ -807,14 +805,15 @@ def set_ticker_daily_prices(
 
 
 def bulk_insert_ticker_daily_prices(
-    conn: sqlite3.Connection, rows: list[tuple[str, str, float]], *, batch_size: int = 500
+    conn: sqlite3.Connection, rows: list[tuple[str, str, float]], *, batch_size: int = 500, commit: bool = True
 ) -> None:
     """Loads (ticker, date, price) triples across MANY tickers via large multi-row INSERT
     statements, chunked to stay under SQLite/Turso's bound-parameter limit (batch_size rows
     x 3 params each). Built for scripts/push_ticker_daily_prices_to_turso.py: pushing millions
     of rows one at a time (set_ticker_daily_prices's shape) would mean millions of Turso
     round-trips; this cuts that down to len(rows) / batch_size. Safe to re-run (ON CONFLICT
-    DO UPDATE, same as set_ticker_daily_prices)."""
+    DO UPDATE, same as set_ticker_daily_prices). commit=False lets a caller share one commit
+    across several batches' worth of calls."""
     for start in range(0, len(rows), batch_size):
         batch = rows[start:start + batch_size]
         placeholders = ",".join("(?,?,?)" for _ in batch)
@@ -824,7 +823,8 @@ def bulk_insert_ticker_daily_prices(
                 ON CONFLICT (ticker, date) DO UPDATE SET price = excluded.price""",
             params,
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
 
 def replace_ticker_daily_prices(
@@ -833,9 +833,11 @@ def replace_ticker_daily_prices(
     """Wipes and rewrites one ticker's ENTIRE stored history - used only when the
     incremental catch-up detects a split has moved the adjustment basis since the last
     full fetch (see update_ticker_daily_prices.py's _needs_rebase). A plain upsert of just
-    the new window would otherwise leave the old rows on the pre-split basis forever."""
+    the new window would otherwise leave the old rows on the pre-split basis forever. Uses
+    the bulk path (not set_ticker_daily_prices) since a full history replace can be years of
+    rows, not a handful."""
     conn.execute("DELETE FROM ticker_daily_prices WHERE ticker = ?", (ticker,))
-    set_ticker_daily_prices(conn, ticker, prices, commit=commit)
+    bulk_insert_ticker_daily_prices(conn, [(ticker, d, p) for d, p in prices], commit=commit)
 
 
 def backfill_delisted_status(conn: sqlite3.Connection) -> int:
