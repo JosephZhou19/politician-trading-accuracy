@@ -61,12 +61,15 @@ class _TursoCursor:
         return self._cursor.lastrowid
 
 
-# Substrings of the two known-recoverable Hrana stream failures: the session going stale
-# between queries (e.g. a scraper busy downloading PDFs) and a server-side idle-transaction
-# rollback (e.g. a slow run of external API calls - Finnhub - sitting inside one open,
-# uncommitted batch for too long). Both are transient and safe to retry once on a fresh
-# connection; anything else re-raises rather than silently retrying an unknown failure.
-_RECOVERABLE_STREAM_ERRORS = ("stream not found", "was idle for too long")
+# Substrings of known-recoverable Hrana/HTTP failures: the session going stale between
+# queries (e.g. a scraper busy downloading PDFs), a server-side idle-transaction rollback
+# (e.g. a slow run of external API calls sitting inside one open, uncommitted batch for too
+# long), and a dropped HTTP connection mid-request (confirmed live, daily-price-trickle.yml,
+# 2026-10-02 - crashed a run immediately after the yfinance batch fetch, with no indication
+# it was caused by request size or shape rather than an ordinary network blip). All three are
+# transient and safe to retry once on a fresh connection; anything else re-raises rather than
+# silently retrying an unknown failure.
+_RECOVERABLE_STREAM_ERRORS = ("stream not found", "was idle for too long", "connection closed")
 
 
 class _TursoConnection:

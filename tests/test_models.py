@@ -501,6 +501,33 @@ def test_turso_reconnects_once_on_idle_transaction_rollback():
     assert "reconnecting" in mock_logger.warning.call_args[0][0]
 
 
+def test_turso_reconnects_once_on_dropped_http_connection():
+    """Regression: crashed a real production run (daily-price-trickle.yml, 2026-10-02)
+    immediately after a yfinance batch fetch, with get_ticker_daily_prices_batch's SELECT as
+    the very next Turso call - looks like an ordinary dropped-connection network blip, not
+    something caused by that query's size or shape, so it's treated the same as the other two
+    known-transient Hrana failures rather than left to crash the run."""
+    conn = _make_turso_connection()
+    call_count = {"n": 0}
+
+    def flaky():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ValueError("Hrana: `http error: `connection closed before message completed``")
+        return "ok"
+
+    with patch.object(conn, "_new_conn", return_value="reconnected-conn") as mock_new_conn, \
+            patch.object(models, "logger") as mock_logger:
+        result = conn._with_reconnect(flaky)
+
+    assert result == "ok"
+    assert call_count["n"] == 2
+    mock_new_conn.assert_called_once()
+    assert conn._conn == "reconnected-conn"
+    mock_logger.warning.assert_called_once()
+    assert "reconnecting" in mock_logger.warning.call_args[0][0]
+
+
 def test_turso_reraises_non_stream_errors():
     conn = _make_turso_connection()
 
