@@ -35,15 +35,32 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # Builds a fresh local sqlite mirror from Turso in the runner, then exports static
-      # JSON from THAT - never a live query against Turso per site visitor. Same two
-      # scripts used for local development, just run here on a schedule instead of by hand.
+      # A GitHub Actions runner starts with no local file at all each run, which would make
+      # sync_local_mirror's own "incremental, not a repeated full-table read" design pointless
+      # here specifically: sync_ticker_daily_prices treats a mirror with no watermarks as a
+      # first-ever sync and does a full pull across all ~3,500 tickers (see its docstring) -
+      # by far the most expensive read path in the whole pipeline. Restoring the previous
+      # run's db file first keeps every run after the first genuinely incremental. Save key
+      # includes run_id so it's always a new cache entry (an exact-key hit would skip saving
+      # the updated file); restore-keys falls back to the most recent prior entry by prefix.
+      - uses: actions/cache/restore@v4
+        with:
+          path: data/congress_trades.db
+          key: mirror-db-${{ github.run_id }}
+          restore-keys: mirror-db-
+
       - run: python -m scripts.sync_local_mirror --db data/congress_trades.db
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
 
-      - run: python scripts/export_website_data.py
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: data/congress_trades.db
+          key: mirror-db-${{ github.run_id }}
+
+      - run: python -m scripts.export_website_data
 
       - uses: actions/upload-pages-artifact@v3
         with:
