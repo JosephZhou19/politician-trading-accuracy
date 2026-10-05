@@ -40,6 +40,18 @@ def test_price_beyond_available_history_returns_none():
     assert h.price_on_or_after(datetime.date(2024, 6, 1)) is None
 
 
+def test_price_point_on_or_after_returns_the_date_it_actually_landed_on():
+    # 2024-01-06 is a Saturday; the roll-forward lands on Monday 2024-01-08, not the
+    # requested Saturday - a caller placing this on a chart needs the real trading date.
+    h = _history([((2024, 1, 5), 100.0), ((2024, 1, 8), 105.0)])
+    assert h.price_point_on_or_after(datetime.date(2024, 1, 6)) == (datetime.date(2024, 1, 8), 105.0)
+
+
+def test_price_point_on_or_after_returns_none_beyond_available_history():
+    h = _history([((2024, 1, 2), 100.0)])
+    assert h.price_point_on_or_after(datetime.date(2024, 6, 1)) is None
+
+
 def test_daily_prices_returns_every_real_point():
     h = _history([((2024, 1, 2), 100.0), ((2024, 1, 3), 101.0)])
     assert h.daily_prices() == [(datetime.date(2024, 1, 2), 100.0), (datetime.date(2024, 1, 3), 101.0)]
@@ -284,6 +296,30 @@ def test_stockanalysis_fallback_converts_timestamps_as_utc():
         h = fetch_ticker_history_stockanalysis("ATVI")
     assert h.price_type == "close"
     assert h.price_on_or_after(datetime.date(2023, 10, 13)) == 94.42
+
+
+def test_stockanalysis_fallback_skips_an_unconvertible_timestamp_point():
+    """Regression: a long-lived ticker's history can include a pre-1970 point (confirmed
+    live: ALE's earliest point is a negative epoch ms timestamp) - fromtimestamp() raises
+    OSError for that on Windows (POSIX handles negative timestamps fine, which is why this
+    wasn't caught by construction). A single unconvertible point must be skipped, not crash
+    the whole fetch and lose the ticker's otherwise-good, much more recent data - real
+    disclosed trades only go back to 2012 anyway, so nothing of value is lost."""
+    body = {"status": 200, "data": [
+        [99999999999999999, 1.0],  # out of range on every platform - OSError/OverflowError
+        [1697155200000, 94.42],    # 2023-10-13T00:00:00Z - a real, convertible point
+    ]}
+    with patch("src.market.prices.requests.get", return_value=_mock_response(body)):
+        h = fetch_ticker_history_stockanalysis("ALE")
+    assert h is not None
+    assert h.price_on_or_after(datetime.date(2023, 10, 13)) == 94.42
+    assert len(h.daily_prices()) == 1
+
+
+def test_stockanalysis_fallback_returns_none_if_every_point_is_unconvertible():
+    body = {"status": 200, "data": [[99999999999999999, 1.0]]}
+    with patch("src.market.prices.requests.get", return_value=_mock_response(body)):
+        assert fetch_ticker_history_stockanalysis("ALE") is None
 
 
 def test_stockanalysis_fallback_returns_none_on_empty_data():

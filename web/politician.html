@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Member Trade Disclosures</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <h1><a href="index.html">Congressional Trade Disclosures</a></h1>
+  <p class="subtitle" id="member-subtitle">Loading…</p>
+  <nav class="site-nav">
+    <a href="index.html" class="active">Members</a>
+    <a href="issuers.html">Issuers</a>
+  </nav>
+</header>
+<main>
+  <div class="disclaimer">
+    Informational only — not investment advice. "Price at disclosure" and "price today" are
+    plain facts, not a claim about skill or timing.
+  </div>
+
+  <div class="stat-row" id="stats"></div>
+
+  <section>
+    <h2>Disclosed Trades</h2>
+    <div id="loading" class="loading">Loading…</div>
+    <div id="not-found" class="empty" style="display:none">No member found for this ID.</div>
+    <table id="trades-table" style="display:none">
+      <thead>
+        <tr>
+          <th data-sort="ticker">Ticker</th>
+          <th>Details</th>
+          <th data-sort="type">Type</th>
+          <th data-sort="amount">Amount</th>
+          <th data-sort="txdate">Transaction Date</th>
+          <th data-sort="notdate">Disclosed</th>
+          <th data-sort="owner">Owner</th>
+          <th data-sort="priceat">Price at Disclosure</th>
+          <th data-sort="pricenow">Price Today</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+<footer>Data source: public House/Senate STOCK Act filings.</footer>
+<script src="app.js"></script>
+<script>
+async function main() {
+  const params = new URLSearchParams(window.location.search);
+  const id = params.get("id");
+
+  const [legislators, tickers, latestPrices] = await Promise.all([
+    fetchJSON("data/legislators.json"),
+    fetchJSON("data/tickers.json"),
+    fetchJSON("data/latest_prices.json"),
+  ]);
+
+  const legislator = legislators.find((l) => String(l.id) === id);
+  if (!legislator) {
+    document.getElementById("loading").style.display = "none";
+    document.getElementById("not-found").style.display = "block";
+    document.getElementById("member-subtitle").textContent = "Member not found";
+    return;
+  }
+
+  document.title = `${legislator.first_name} ${legislator.last_name} — Trade Disclosures`;
+  const partyState = [legislator.party, legislator.state].filter(Boolean).join(" · ");
+  document.getElementById("member-subtitle").textContent =
+    `${legislator.first_name} ${legislator.last_name} · ${chamberLabel(legislator.chamber)}` +
+    (partyState ? ` · ${partyState}` : "");
+
+  let trades = [];
+  try {
+    trades = await fetchJSON(`data/trades/${legislator.id}.json`);
+  } catch (e) {
+    trades = [];
+  }
+
+  const buys = trades.filter((t) => t.transaction_type === "purchase").length;
+  const sells = trades.filter((t) => t.transaction_type.startsWith("sale")).length;
+  document.getElementById("stats").innerHTML = `
+    <div class="stat"><div class="label">Total Disclosed Trades</div><div class="value">${trades.length}</div></div>
+    <div class="stat"><div class="label">Buys</div><div class="value">${buys}</div></div>
+    <div class="stat"><div class="label">Sells</div><div class="value">${sells}</div></div>
+  `;
+
+  const tbody = document.querySelector("#trades-table tbody");
+  tbody.innerHTML = trades.map((t) => {
+    const priceNow = t.ticker && latestPrices[t.ticker] ? latestPrices[t.ticker].price : null;
+    const assetName = t.ticker ? (tickers[t.ticker] || t.ticker) : (t.asset_name || "—");
+    return `
+      <tr>
+        <td data-sort-value="${escapeHtml(t.ticker || "")}" title="${escapeHtml(assetName)}">
+          ${t.ticker ? `<a href="ticker.html?ticker=${encodeURIComponent(t.ticker)}">${escapeHtml(t.ticker)}</a>` : "—"}
+        </td>
+        <td class="details" title="${escapeHtml(assetName)}${t.comment ? ' — ' + escapeHtml(t.comment) : ''}">${tradeDetails(t, tickers)}</td>
+        <td data-sort-value="${escapeHtml(t.transaction_type)}" class="${typeClass(t.transaction_type)}">${typeLabel(t.transaction_type)}</td>
+        <td data-sort-value="${t.amount_low}">${formatAmount(t.amount_low, t.amount_high)}</td>
+        <td data-sort-value="${t.transaction_date}">${formatDate(t.transaction_date)}</td>
+        <td data-sort-value="${t.notification_date}">${formatDate(t.notification_date)}</td>
+        <td data-sort-value="${escapeHtml(t.owner || "")}">${escapeHtml(t.owner || "—")}</td>
+        <td data-sort-value="${t.price_at_notification ?? ""}">${formatPrice(t.price_at_notification)}</td>
+        <td data-sort-value="${priceNow ?? ""}">${formatPrice(priceNow)}</td>
+      </tr>
+    `;
+  }).join("");
+
+  document.getElementById("loading").style.display = "none";
+  if (trades.length === 0) {
+    document.getElementById("not-found").textContent = "No disclosed trades found.";
+    document.getElementById("not-found").style.display = "block";
+  } else {
+    document.getElementById("trades-table").style.display = "table";
+    makeSortable(document.getElementById("trades-table"));
+  }
+}
+
+main();
+</script>
+</body>
+</html>

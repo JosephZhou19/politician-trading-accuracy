@@ -5,3 +5,4 @@ pytest
 libsql
 python-dotenv
 yfinance
+pyyaml

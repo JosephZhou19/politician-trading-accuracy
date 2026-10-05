@@ -77,6 +77,14 @@ class TickerHistory:
         returning it as-is. None if there's no valid price within MAX_ROLL_FORWARD_DAYS of
         target_date - either the history ends before target_date, or (a recycled ticker
         symbol) it doesn't cover that era at all."""
+        point = self.price_point_on_or_after(target_date)
+        return point[1] if point is not None else None
+
+    def price_point_on_or_after(self, target_date: datetime.date) -> tuple[datetime.date, float] | None:
+        """Same search as price_on_or_after, but returns the (date, price) pair instead of
+        just the price - for a caller that needs to know which actual trading day the price
+        landed on (e.g. placing a marker on a chart drawn from this same history's
+        daily_prices(), where the target date itself may have been a weekend/holiday)."""
         idx = self._opens.index.searchsorted(target_date)
         while idx < len(self._opens):
             found_date = self._opens.index[idx]
@@ -84,7 +92,7 @@ class TickerHistory:
                 return None
             price = self._opens.iloc[idx]
             if not math.isnan(price) and self.MIN_PLAUSIBLE_PRICE <= price <= self.MAX_PLAUSIBLE_PRICE:
-                return float(price)
+                return (found_date, float(price))
             idx += 1
         return None
 
@@ -251,10 +259,23 @@ def fetch_ticker_history_stockanalysis(ticker: str) -> TickerHistory | None:
     # UTC, not local time - the API's timestamps are UTC-midnight markers, and
     # date.fromtimestamp() (local tz) shifted them back a day on this machine (confirmed:
     # ATVI's real last timestamp landed on 2023-10-12 instead of its actual 2023-10-13).
-    dates = [
-        datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.timezone.utc).date()
-        for ts, _ in points
-    ]
-    prices = [price for _, price in points]
+    #
+    # Some long-lived tickers' history goes back before 1970 (confirmed live: ALE's earliest
+    # point is a negative epoch ms timestamp) - Windows' C runtime can't represent a negative
+    # time_t at all, so fromtimestamp() raises OSError there (POSIX handles it fine, which is
+    # why this wasn't caught by construction). Irrelevant anyway - real disclosed trades only
+    # go back to 2012 - so an unconvertible point is just skipped, not treated as a reason to
+    # give up on the whole ticker's otherwise-good, much more recent data.
+    dates = []
+    prices = []
+    for ts, price in points:
+        try:
+            date = datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.timezone.utc).date()
+        except (OSError, OverflowError, ValueError):
+            continue
+        dates.append(date)
+        prices.append(price)
+    if not dates:
+        return None
     closes = pd.Series(prices, index=pd.Index(dates))
     return TickerHistory(ticker, closes, price_type="close")

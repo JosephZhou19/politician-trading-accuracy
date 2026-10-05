@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Congressional Trade Disclosures</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <h1><a href="index.html">Congressional Trade Disclosures</a></h1>
+  <p class="subtitle">Public STOCK Act periodic transaction reports, filed by members of the U.S. House and Senate</p>
+  <nav class="site-nav">
+    <a href="index.html" class="active">Members</a>
+    <a href="issuers.html">Issuers</a>
+  </nav>
+</header>
+<main>
+  <div class="disclaimer">
+    This page shows only what members of Congress have publicly disclosed under the STOCK Act.
+    It is informational only — not investment advice, and not a claim that any trade shown here
+    reflects skill, insight, or wrongdoing.
+  </div>
+
+  <section>
+    <h2>Most Recent Disclosures</h2>
+    <div id="recent-loading" class="loading">Loading…</div>
+    <div class="feed-panel" id="recent-panel" style="display:none">
+      <table id="recent-table">
+        <thead>
+          <tr>
+            <th>Member</th>
+            <th>Ticker</th>
+            <th>Details</th>
+            <th>Type</th>
+            <th>Amount</th>
+            <th>Transaction Date</th>
+            <th>Disclosed</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Members of Congress</h2>
+    <div class="filter-row">
+      <input type="search" id="legislator-search" placeholder="Search by name…">
+      <select id="party-filter"><option value="">All parties</option></select>
+      <select id="state-filter"><option value="">All states</option></select>
+    </div>
+    <div id="legislators-loading" class="loading">Loading…</div>
+    <table id="legislators-table" style="display:none">
+      <thead>
+        <tr>
+          <th data-sort="name">Name</th>
+          <th data-sort="chamber">Chamber</th>
+          <th data-sort="party">Party</th>
+          <th data-sort="state">State</th>
+          <th data-sort="trades">Disclosed Trades</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+<footer>Data source: public House/Senate STOCK Act filings.</footer>
+<script src="app.js"></script>
+<script>
+let allLegislators = [];
+
+function populateFilterOptions(selectEl, values) {
+  const sorted = Array.from(new Set(values.filter(Boolean))).sort();
+  for (const v of sorted) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    selectEl.appendChild(opt);
+  }
+}
+
+function applyFilters() {
+  const q = document.getElementById("legislator-search").value.trim().toLowerCase();
+  const party = document.getElementById("party-filter").value;
+  const state = document.getElementById("state-filter").value;
+  const filtered = allLegislators.filter((l) => {
+    if (q && !`${l.first_name} ${l.last_name}`.toLowerCase().includes(q)) return false;
+    if (party && l.party !== party) return false;
+    if (state && l.state !== state) return false;
+    return true;
+  });
+  renderLegislators(filtered);
+}
+
+async function loadLegislators() {
+  allLegislators = await fetchJSON("data/legislators.json");
+  renderLegislators(allLegislators);
+  populateFilterOptions(document.getElementById("party-filter"), allLegislators.map((l) => l.party));
+  populateFilterOptions(document.getElementById("state-filter"), allLegislators.map((l) => l.state));
+  document.getElementById("legislators-loading").style.display = "none";
+  document.getElementById("legislators-table").style.display = "table";
+  makeSortable(document.getElementById("legislators-table"));
+}
+
+function renderLegislators(list) {
+  const tbody = document.querySelector("#legislators-table tbody");
+  tbody.innerHTML = list.map((l) => `
+    <tr>
+      <td data-sort-value="${escapeHtml(l.last_name)}">
+        <a href="politician.html?id=${l.id}">${escapeHtml(l.first_name)} ${escapeHtml(l.last_name)}</a>
+      </td>
+      <td data-sort-value="${escapeHtml(l.chamber)}">${chamberLabel(l.chamber)}</td>
+      <td data-sort-value="${escapeHtml(l.party || "")}">${escapeHtml(l.party || "—")}</td>
+      <td data-sort-value="${escapeHtml(l.state || "")}">${escapeHtml(l.state || "—")}</td>
+      <td data-sort-value="${l.trade_count}">${l.trade_count.toLocaleString()}</td>
+    </tr>
+  `).join("");
+}
+
+document.getElementById("legislator-search").addEventListener("input", applyFilters);
+document.getElementById("party-filter").addEventListener("change", applyFilters);
+document.getElementById("state-filter").addEventListener("change", applyFilters);
+
+async function loadRecent() {
+  const recent = await fetchJSON("data/recent_trades.json");
+  const tbody = document.querySelector("#recent-table tbody");
+  tbody.innerHTML = recent.map((t) => `
+    <tr>
+      <td><a href="politician.html?id=${t.legislator_id}">${escapeHtml(t.legislator_name)}</a></td>
+      <td>${t.ticker ? `<a href="ticker.html?ticker=${encodeURIComponent(t.ticker)}">${escapeHtml(t.ticker)}</a>` : "—"}</td>
+      <td class="details" title="${escapeHtml(t.asset_name || "")}${t.comment ? ' — ' + escapeHtml(t.comment) : ''}">${[t.asset_name && escapeHtml(t.asset_name), t.comment && `<span class="muted">${escapeHtml(t.comment)}</span>`].filter(Boolean).join(" — ") || "—"}</td>
+      <td class="${typeClass(t.transaction_type)}">${typeLabel(t.transaction_type)}</td>
+      <td>${formatAmount(t.amount_low, t.amount_high)}</td>
+      <td>${formatDate(t.transaction_date)}</td>
+      <td>${formatDate(t.notification_date)}</td>
+    </tr>
+  `).join("");
+  document.getElementById("recent-loading").style.display = "none";
+  document.getElementById("recent-panel").style.display = "block";
+}
+
+loadLegislators();
+loadRecent();
+</script>
+</body>
+</html>

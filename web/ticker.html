@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ticker Trade Disclosures</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <h1><a href="index.html">Congressional Trade Disclosures</a></h1>
+  <p class="subtitle" id="ticker-subtitle">Loading…</p>
+  <nav class="site-nav">
+    <a href="index.html">Members</a>
+    <a href="issuers.html" class="active">Issuers</a>
+  </nav>
+</header>
+<main>
+  <div class="disclaimer">
+    Informational only — not investment advice. "Price at disclosure" and "price today" are
+    plain facts, not a claim about skill or timing.
+  </div>
+
+  <div class="stat-row" id="stats"></div>
+
+  <section>
+    <h2>Price History</h2>
+    <div id="chart-loading" class="loading">Loading…</div>
+    <div id="chart-empty" class="empty" style="display:none">No price history available for this ticker.</div>
+    <div id="chart-controls" class="range-buttons" style="display:none">
+      <button type="button" data-range="90d" class="active">90D</button>
+      <button type="button" data-range="6m">6M</button>
+      <button type="button" data-range="1y">1Y</button>
+      <button type="button" data-range="3y">3Y</button>
+      <button type="button" data-range="all">All</button>
+    </div>
+    <div class="chart-wrap" id="chart-wrap" style="display:none">
+      <canvas id="price-chart"></canvas>
+    </div>
+    <p class="muted" id="chart-legend" style="display:none">
+      <span class="dot buy"></span> Buy &nbsp; <span class="dot sell"></span> Sell
+    </p>
+  </section>
+
+  <section>
+    <h2>Disclosed Trades</h2>
+    <div id="loading" class="loading">Loading…</div>
+    <div id="not-found" class="empty" style="display:none">No disclosed trades found for this ticker.</div>
+    <table id="trades-table" style="display:none">
+      <thead>
+        <tr>
+          <th data-sort="member">Member</th>
+          <th data-sort="chamber">Chamber</th>
+          <th>Details</th>
+          <th data-sort="type">Type</th>
+          <th data-sort="amount">Amount</th>
+          <th data-sort="txdate">Transaction Date</th>
+          <th data-sort="notdate">Disclosed</th>
+          <th data-sort="priceat">Price at Disclosure</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+<footer>Data source: public House/Senate STOCK Act filings.</footer>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="app.js"></script>
+<script>
+const RANGE_DAYS = { "90d": 90, "6m": 182, "1y": 365, "3y": 365 * 3 };
+
+// Trading days aren't evenly spaced by calendar date (weekends, holidays), so "last 90 days"
+// is computed as a real calendar cutoff, then mapped to the first index whose date falls on
+// or after it - not "the last 90 entries", which would silently cover more calendar time
+// than the button claims once index spacing varies.
+function computeStartIndex(dates, rangeKey) {
+  if (rangeKey === "all" || dates.length === 0) return 0;
+  const lastDate = new Date(dates[dates.length - 1] + "T00:00:00");
+  const cutoff = new Date(lastDate);
+  cutoff.setDate(cutoff.getDate() - RANGE_DAYS[rangeKey]);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  const idx = dates.findIndex((d) => d >= cutoffStr);
+  return idx === -1 ? 0 : idx;
+}
+
+// Plots the full daily price series as a line, with each disclosed buy/sell overlaid as a
+// scatter point. Uses a linear index x-axis (0, 1, 2, ... one per trading day) rather than a
+// date/category axis - a marker's x is simply the index of its price_date within the same
+// `series` array the line is drawn from, so a marker and the line point it sits on are
+// guaranteed to land at the exact same x position with no separate date-alignment logic to
+// get subtly wrong. The tick/tooltip callbacks map an index back to its real date for display.
+function renderPriceChart(canvas, controlsEl, series, trades) {
+  const dates = series.map((p) => p[0]);
+  const prices = series.map((p) => p[1]);
+  const dateToIndex = new Map(dates.map((d, i) => [d, i]));
+  const linePoints = series.map((p, i) => ({ x: i, y: p[1] }));
+
+  const buyPoints = [], sellPoints = [];
+  for (const t of trades) {
+    if (t.price_date == null || t.price_at_notification == null) continue;
+    const index = dateToIndex.get(t.price_date);
+    if (index == null) continue;
+    const point = { x: index, y: t.price_at_notification, trade: t };
+    (t.transaction_type === "purchase" ? buyPoints : sellPoints).push(point);
+  }
+
+  const tooltipForMarker = (context) => {
+    const t = context.raw.trade;
+    return [
+      `${t.legislator_name} — ${typeLabel(t.transaction_type)}`,
+      `${formatAmount(t.amount_low, t.amount_high)} on ${formatDate(t.transaction_date)}`,
+      `$${context.raw.y.toFixed(2)}`,
+    ];
+  };
+
+  const chart = new Chart(canvas, {
+    type: "line",
+    data: {
+      datasets: [
+        {
+          type: "line", label: "Price", data: linePoints, borderColor: "#6ea8fe",
+          borderWidth: 1.5, pointRadius: 0, tension: 0,
+        },
+        {
+          type: "scatter", label: "Buy", data: buyPoints, backgroundColor: "#4caf6a",
+          pointRadius: 5, pointHoverRadius: 7,
+        },
+        {
+          type: "scatter", label: "Sell", data: sellPoints, backgroundColor: "#e06b6b",
+          pointRadius: 5, pointHoverRadius: 7,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "nearest", intersect: true },
+      scales: {
+        x: {
+          type: "linear", min: 0, max: series.length - 1,
+          ticks: {
+            maxTicksLimit: 10, color: "#9aa3b2",
+            callback: (value) => dates[Math.round(value)] || "",
+          },
+          grid: { color: "#2a2f3a" },
+        },
+        y: { ticks: { color: "#9aa3b2" }, grid: { color: "#2a2f3a" } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: (items) => dates[Math.round(items[0].parsed.x)] || "",
+            label: (context) => context.datasetIndex === 0
+              ? `Price: $${context.parsed.y.toFixed(2)}`
+              : tooltipForMarker(context),
+          },
+        },
+      },
+    },
+  });
+
+  // A plain x-axis zoom alone would still scale the y-axis to the FULL history's price
+  // range (Chart.js doesn't auto-fit y to only what's currently visible), so a 90-day
+  // window on a stock that's up 100x since 2016 would render as a flat line pinned to the
+  // top of the chart. Compute y bounds from only the prices inside the selected window.
+  function setRange(rangeKey) {
+    const startIndex = computeStartIndex(dates, rangeKey);
+    const visiblePrices = prices.slice(startIndex);
+    const lo = Math.min(...visiblePrices), hi = Math.max(...visiblePrices);
+    const padding = (hi - lo) * 0.08 || hi * 0.08 || 1;
+
+    chart.options.scales.x.min = startIndex;
+    chart.options.scales.x.max = series.length - 1;
+    chart.options.scales.y.min = Math.max(0, lo - padding);
+    chart.options.scales.y.max = hi + padding;
+    chart.update();
+
+    controlsEl.querySelectorAll("button").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.range === rangeKey);
+    });
+  }
+
+  controlsEl.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", () => setRange(btn.dataset.range));
+  });
+
+  setRange("90d");
+}
+
+async function main() {
+  const params = new URLSearchParams(window.location.search);
+  const ticker = params.get("ticker");
+
+  const [tickers, latestPrices] = await Promise.all([
+    fetchJSON("data/tickers.json"),
+    fetchJSON("data/latest_prices.json"),
+  ]);
+
+  const assetName = ticker ? tickers[ticker] : null;
+  document.title = `${ticker} — Trade Disclosures`;
+  document.getElementById("ticker-subtitle").textContent =
+    assetName ? `${ticker} · ${assetName}` : (ticker || "Unknown ticker");
+
+  let trades = [];
+  try {
+    trades = await fetchJSON(`data/by_ticker/${encodeURIComponent(ticker)}.json`);
+  } catch (e) {
+    trades = [];
+  }
+
+  let priceSeries = [];
+  try {
+    priceSeries = await fetchJSON(`data/prices/${encodeURIComponent(ticker)}.json`);
+  } catch (e) {
+    priceSeries = [];
+  }
+  document.getElementById("chart-loading").style.display = "none";
+  if (priceSeries.length === 0) {
+    document.getElementById("chart-empty").style.display = "block";
+  } else {
+    renderPriceChart(
+      document.getElementById("price-chart"), document.getElementById("chart-controls"),
+      priceSeries, trades,
+    );
+    document.getElementById("chart-controls").style.display = "flex";
+    document.getElementById("chart-wrap").style.display = "block";
+    document.getElementById("chart-legend").style.display = "block";
+  }
+
+  const priceNow = ticker && latestPrices[ticker] ? latestPrices[ticker] : null;
+  const buys = trades.filter((t) => t.transaction_type === "purchase").length;
+  const sells = trades.filter((t) => t.transaction_type.startsWith("sale")).length;
+  document.getElementById("stats").innerHTML = `
+    <div class="stat"><div class="label">Total Disclosed Trades</div><div class="value">${trades.length}</div></div>
+    <div class="stat"><div class="label">Buys / Sells</div><div class="value">${buys} / ${sells}</div></div>
+    <div class="stat"><div class="label">Current Price</div><div class="value">${priceNow ? formatPrice(priceNow.price) : "—"}</div></div>
+  `;
+
+  const tbody = document.querySelector("#trades-table tbody");
+  tbody.innerHTML = trades.map((t) => `
+    <tr>
+      <td data-sort-value="${escapeHtml(t.legislator_name)}">
+        <a href="politician.html?id=${t.legislator_id}">${escapeHtml(t.legislator_name)}</a>
+      </td>
+      <td data-sort-value="${escapeHtml(t.chamber || "")}">${chamberLabel(t.chamber)}</td>
+      <td class="details" title="${escapeHtml(t.comment || "")}">${t.comment ? `<span class="muted">${escapeHtml(t.comment)}</span>` : "—"}</td>
+      <td data-sort-value="${escapeHtml(t.transaction_type)}" class="${typeClass(t.transaction_type)}">${typeLabel(t.transaction_type)}</td>
+      <td data-sort-value="${t.amount_low}">${formatAmount(t.amount_low, t.amount_high)}</td>
+      <td data-sort-value="${t.transaction_date}">${formatDate(t.transaction_date)}</td>
+      <td data-sort-value="${t.notification_date}">${formatDate(t.notification_date)}</td>
+      <td data-sort-value="${t.price_at_notification ?? ""}">${formatPrice(t.price_at_notification)}</td>
+    </tr>
+  `).join("");
+
+  document.getElementById("loading").style.display = "none";
+  if (trades.length === 0) {
+    document.getElementById("not-found").style.display = "block";
+  } else {
+    document.getElementById("trades-table").style.display = "table";
+    makeSortable(document.getElementById("trades-table"));
+  }
+}
+
+main();
+</script>
+</body>
+</html>
