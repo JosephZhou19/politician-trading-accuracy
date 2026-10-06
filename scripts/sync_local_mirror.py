@@ -126,9 +126,43 @@ def sync_small_table(turso, local, table):
 # adjustment basis since the last sync - same convention as
 # update_ticker_daily_prices.py's _needs_rebase.
 _REBASE_RATIO_THRESHOLD = 1.5
-# Bound-parameter-limit batching for the per-batch subquery joins below (_watermark_subquery)
-# - each ticker costs 2 params (ticker, date), so this stays well under Turso/SQLite's limit.
-_TICKER_JOIN_BATCH_SIZE = 250
+# Batching for the per-batch subquery joins below (_watermark_subquery). NOT bound by the
+# param-count limit the original comment here assumed (SQLite/Turso's default is far higher
+# than this) - confirmed live against production that this Turso instance's real ceiling is
+# the *compound SELECT term* count (each ticker contributes one `UNION ALL SELECT` term):
+# binary-searched directly, 50 terms succeeds, 51 fails with "too many terms in compound
+# SELECT" - much stricter than the 250 originally assumed and apparently never actually
+# exercised at that size before (every prior sync only ever pulled a small delta). Kept well
+# under the confirmed ceiling, not right at it, in case it varies slightly by instance/plan.
+_TICKER_JOIN_BATCH_SIZE = 40
+
+_COMPOUND_SELECT_LIMIT_ERROR = "too many terms in compound SELECT"
+
+
+def _run_ticker_batch(turso, run_batch, batch):
+    """Runs a per-batch ticker join query (run_batch(batch) -> rows), bisecting and retrying
+    on Turso's compound-SELECT term limit rather than failing the whole sync outright. Belt-
+    and-suspenders, not the actual fix for the one real incident this guards against: a
+    scheduled run failed with this exact error on 2026-10-06 because the COMMITTED
+    _TICKER_JOIN_BATCH_SIZE was still 250 (a stale, never-pushed value) while a local,
+    uncommitted fix to 40 had been sitting in the working tree - CI checks out git, not the
+    working tree, so it ran the broken value. That's fully explained and fixed by committing
+    40. This bisection is cheap insurance on top, in case the real ceiling is ever lower than
+    expected for some other reason in the future - not a claim that it's needed today.
+    Halving stops at a batch of 1, where a real failure has nothing left to blame on batch
+    size and is left to propagate."""
+    if len(batch) <= 1:
+        return run_batch(batch)
+    try:
+        return run_batch(batch)
+    except ValueError as e:
+        if _COMPOUND_SELECT_LIMIT_ERROR not in str(e):
+            raise
+        mid = len(batch) // 2
+        return (
+            _run_ticker_batch(turso, run_batch, batch[:mid])
+            + _run_ticker_batch(turso, run_batch, batch[mid:])
+        )
 
 
 def _local_ticker_watermarks(local):
@@ -163,15 +197,19 @@ def _find_rebased_tickers(turso, watermarks):
     point lookup stays cheap here."""
     tickers = list(watermarks)
     rebased = set()
-    for start in range(0, len(tickers), _TICKER_JOIN_BATCH_SIZE):
-        batch = tickers[start:start + _TICKER_JOIN_BATCH_SIZE]
+
+    def run_batch(batch):
         params = [v for t in batch for v in (t, watermarks[t][0])]
-        rows = turso.execute(
+        return turso.execute(
             f"""SELECT t.ticker, t.price FROM ticker_daily_prices t
                 JOIN ({_watermark_subquery(batch)}) w
                   ON t.ticker = w.ticker AND t.date = w.wdate""",
             params,
         ).fetchall()
+
+    for start in range(0, len(tickers), _TICKER_JOIN_BATCH_SIZE):
+        batch = tickers[start:start + _TICKER_JOIN_BATCH_SIZE]
+        rows = _run_ticker_batch(turso, run_batch, batch)
         turso_prices = {r["ticker"]: r["price"] for r in rows}
         for ticker in batch:
             turso_price = turso_prices.get(ticker)
@@ -190,15 +228,19 @@ def _pull_incremental_ticker_prices(turso, local, tickers, watermarks):
     rows that are actually new, so the read cost is proportional to what changed, not to how
     many tickers were checked or how much history each one has."""
     total = 0
-    for start in range(0, len(tickers), _TICKER_JOIN_BATCH_SIZE):
-        batch = tickers[start:start + _TICKER_JOIN_BATCH_SIZE]
+
+    def run_batch(batch):
         params = [v for t in batch for v in (t, watermarks[t][0])]
-        rows = turso.execute(
+        return turso.execute(
             f"""SELECT t.ticker, t.date, t.price FROM ticker_daily_prices t
                 JOIN ({_watermark_subquery(batch)}) w
                   ON t.ticker = w.ticker AND t.date > w.wdate""",
             params,
         ).fetchall()
+
+    for start in range(0, len(tickers), _TICKER_JOIN_BATCH_SIZE):
+        batch = tickers[start:start + _TICKER_JOIN_BATCH_SIZE]
+        rows = _run_ticker_batch(turso, run_batch, batch)
         total += _replace_rows(local, "ticker_daily_prices", rows)
     return total
 

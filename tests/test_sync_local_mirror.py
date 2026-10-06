@@ -3,6 +3,7 @@ import pytest
 
 from scripts.sync_local_mirror import (
     _connect_turso,
+    _run_ticker_batch,
     sync_append_only,
     sync_filings,
     sync_small_table,
@@ -253,3 +254,43 @@ def test_connect_turso_refuses_without_credentials(monkeypatch):
     monkeypatch.delenv("TURSO_AUTH_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="refusing to sync"):
         _connect_turso()
+
+
+def test_run_ticker_batch_bisects_on_compound_select_limit_error():
+    """A batch that fails with Turso's compound-SELECT term limit error gets split in half
+    and retried instead of failing the whole sync - see _run_ticker_batch's own docstring for
+    the one real incident (a stale, never-committed batch size) this is cheap insurance
+    against, in case the real ceiling is ever lower than expected for some other reason."""
+    calls = []
+
+    def run_batch(batch):
+        calls.append(list(batch))
+        if len(batch) > 2:
+            raise ValueError("SQLite error: too many terms in compound SELECT")
+        return list(batch)
+
+    result = _run_ticker_batch(None, run_batch, ["A", "B", "C", "D", "E"])
+
+    assert result == ["A", "B", "C", "D", "E"]
+    assert calls[0] == ["A", "B", "C", "D", "E"]  # first attempt, at the full batch size
+    assert len(calls) > 1  # the full-size attempt failed and triggered at least one retry
+    successful_batches = [c for c in calls if len(c) <= 2]
+    assert sum(len(c) for c in successful_batches) == 5  # every ticker eventually succeeded
+
+
+def test_run_ticker_batch_reraises_unrelated_errors():
+    def run_batch(batch):
+        raise ValueError("some other failure")
+
+    with pytest.raises(ValueError, match="some other failure"):
+        _run_ticker_batch(None, run_batch, ["A", "B", "C"])
+
+
+def test_run_ticker_batch_does_not_bisect_a_batch_of_one():
+    """A single-ticker batch that still fails has nothing left to blame on batch size - it
+    should propagate instead of bisecting into an empty batch."""
+    def run_batch(batch):
+        raise ValueError("too many terms in compound SELECT")
+
+    with pytest.raises(ValueError, match="too many terms"):
+        _run_ticker_batch(None, run_batch, ["A"])
