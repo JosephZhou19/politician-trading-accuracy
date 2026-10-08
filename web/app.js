@@ -70,6 +70,37 @@ function chamberLabel(chamber) {
   return chamber || "—";
 }
 
+// Finds the first entry in a `[[date, price], ...]` series (ascending, as prices/*.json
+// stores it) on or after targetDateStr, rolling forward up to maxRollForwardDays to land on
+// the next real trading day past a weekend/holiday - same convention as
+// TickerHistory.price_on_or_after on the Python side, reimplemented here since a trade's
+// transaction-date price isn't precomputed anywhere in the export (only its disclosure-date
+// price is, as price_at_notification/price_date). Returns null past that window.
+function priceOnOrAfter(series, targetDateStr, maxRollForwardDays = 10) {
+  const cutoff = new Date(targetDateStr + "T00:00:00");
+  cutoff.setDate(cutoff.getDate() + maxRollForwardDays);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  for (const [date, price] of series) {
+    if (date >= targetDateStr) return date <= cutoffStr ? [date, price] : null;
+  }
+  return null;
+}
+
+// Makes a whole <tr> navigate to href on click, without hijacking clicks on an inner <a>
+// (e.g. a ticker or member link in the same row) - those should still behave like normal
+// links, not get overridden by the row's own navigation.
+function makeRowsClickable(tbody, hrefForRow) {
+  tbody.querySelectorAll("tr").forEach((tr, i) => {
+    const href = hrefForRow(i);
+    if (!href) return;
+    tr.classList.add("row-link");
+    tr.addEventListener("click", (e) => {
+      if (e.target.closest("a")) return;
+      window.location.href = href;
+    });
+  });
+}
+
 // Makes a <table> sortable by clicking header cells - re-sorts the existing <tbody> rows
 // in place using each cell's data-sort-value attribute (falls back to visible text).
 function makeSortable(table) {

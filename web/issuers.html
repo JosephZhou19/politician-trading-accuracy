@@ -24,23 +24,31 @@
 
   <section>
     <h2>Traded Issuers</h2>
+    <p class="muted">Stocks only - bonds, funds, and other non-stock disclosures are excluded.</p>
     <input type="search" id="issuer-search" placeholder="Search by ticker or name…">
     <div id="loading" class="loading">Loading…</div>
-    <table id="issuers-table" style="display:none">
-      <thead>
-        <tr>
-          <th data-sort="ticker">Ticker</th>
-          <th data-sort="name">Name</th>
-          <th data-sort="last">Last Traded</th>
-          <th data-sort="volume">Disclosed Volume</th>
-          <th data-sort="trades">Trades</th>
-          <th data-sort="politicians">Politicians</th>
-          <th data-sort="price">Current Price</th>
-          <th data-sort="change">30-Day Change</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
+    <div class="feed-panel" id="issuers-panel" style="display:none">
+      <table id="issuers-table">
+        <colgroup>
+          <col style="width:8%"><col style="width:28%"><col style="width:11%">
+          <col style="width:13%"><col style="width:8%"><col style="width:9%">
+          <col style="width:10%"><col style="width:13%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th data-sort="ticker">Ticker</th>
+            <th data-sort="name">Name</th>
+            <th data-sort="last">Last Traded</th>
+            <th data-sort="volume">Disclosed Volume</th>
+            <th data-sort="trades">Trades</th>
+            <th data-sort="politicians">Politicians</th>
+            <th data-sort="price">Current Price</th>
+            <th data-sort="change">30-Day Change</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </section>
 </main>
 <footer>Data source: public House/Senate STOCK Act filings.</footer>
@@ -68,7 +76,7 @@ function render(list) {
       <td data-sort-value="${escapeHtml(i.ticker)}">
         <a href="ticker.html?ticker=${encodeURIComponent(i.ticker)}">${escapeHtml(i.ticker)}</a>
       </td>
-      <td>${escapeHtml(i.asset_name)}</td>
+      <td title="${escapeHtml(i.asset_name)}">${escapeHtml(i.asset_name)}</td>
       <td data-sort-value="${i.last_traded}">${formatDate(i.last_traded)}</td>
       <td data-sort-value="${i.volume}">${formatVolume(i.volume)}</td>
       <td data-sort-value="${i.trade_count}">${i.trade_count.toLocaleString()}</td>
@@ -83,7 +91,7 @@ async function main() {
   allIssuers = await fetchJSON("data/issuers.json");
   render(allIssuers);
   document.getElementById("loading").style.display = "none";
-  document.getElementById("issuers-table").style.display = "table";
+  document.getElementById("issuers-panel").style.display = "block";
   makeSortable(document.getElementById("issuers-table"));
 }
 

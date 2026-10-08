@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trade Detail</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <h1><a href="index.html">Congressional Trade Disclosures</a></h1>
+  <p class="subtitle" id="trade-subtitle">Loading…</p>
+  <nav class="site-nav">
+    <a href="index.html">Members</a>
+    <a href="issuers.html">Issuers</a>
+  </nav>
+</header>
+<main>
+  <div class="disclaimer">
+    Informational only — not investment advice. "Price at transaction" and "price at
+    disclosure" are plain facts, not a claim about skill or timing.
+  </div>
+
+  <div id="loading" class="loading">Loading…</div>
+  <div id="not-found" class="empty" style="display:none">Trade not found.</div>
+
+  <div id="trade-content" style="display:none">
+    <div class="stat-row" id="stats"></div>
+
+    <section id="comment-section" style="display:none">
+      <h2>Filing Comment</h2>
+      <p class="muted" id="comment-text"></p>
+    </section>
+
+    <section id="chart-section" style="display:none">
+      <h2>Price History</h2>
+      <div id="chart-controls" class="range-buttons">
+        <button type="button" data-range="near" class="active">Near This Trade</button>
+        <button type="button" data-range="all">Full History</button>
+      </div>
+      <div class="chart-wrap" id="chart-wrap">
+        <canvas id="price-chart"></canvas>
+      </div>
+      <p class="muted" id="chart-legend">
+        <span class="dot buy"></span> Price at Transaction (Buy) &nbsp;
+        <span class="dot sell"></span> Price at Transaction (Sell) &nbsp;
+        <span class="dot disclosure"></span> Price at Disclosure
+      </p>
+    </section>
+    <div id="no-chart" class="empty" style="display:none">
+      No price chart available — this disclosure has no resolvable ticker.
+    </div>
+  </div>
+</main>
+<footer>Data source: public House/Senate STOCK Act filings.</footer>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="app.js"></script>
+<script>
+// Centers the default chart window on the trade itself (not on "today", unlike ticker.html's
+// range buttons) - a historical trade is usually nowhere near the end of the price series, so
+// reusing that same "last N days" logic here would often show an empty or irrelevant window.
+function computeWindowIndices(dates, centerDateStr, paddingDays) {
+  const center = new Date(centerDateStr + "T00:00:00");
+  const start = new Date(center); start.setDate(start.getDate() - paddingDays);
+  const end = new Date(center); end.setDate(end.getDate() + paddingDays);
+  const startStr = start.toISOString().slice(0, 10), endStr = end.toISOString().slice(0, 10);
+  let startIdx = dates.findIndex((d) => d >= startStr);
+  if (startIdx === -1) startIdx = dates.length - 1;
+  let endIdx = dates.length - 1;
+  for (let i = dates.length - 1; i >= 0; i--) {
+    if (dates[i] <= endStr) { endIdx = i; break; }
+  }
+  return [startIdx, Math.max(endIdx, startIdx)];
+}
+
+function renderTradeChart(canvas, controlsEl, series, trade, txResult) {
+  const dates = series.map((p) => p[0]);
+  const prices = series.map((p) => p[1]);
+  const dateToIndex = new Map(dates.map((d, i) => [d, i]));
+  const linePoints = series.map((p, i) => ({ x: i, y: p[1] }));
+
+  const txPoint = txResult && dateToIndex.has(txResult[0])
+    ? { x: dateToIndex.get(txResult[0]), y: txResult[1] } : null;
+  const discPoint = trade.price_date != null && dateToIndex.has(trade.price_date)
+    ? { x: dateToIndex.get(trade.price_date), y: trade.price_at_notification } : null;
+
+  const isBuy = trade.transaction_type === "purchase";
+  const txColor = isBuy ? "#4caf6a" : (trade.transaction_type === "exchange" ? "#9aa3b2" : "#e06b6b");
+
+  const chart = new Chart(canvas, {
+    type: "line",
+    data: {
+      datasets: [
+        { type: "line", label: "Price", data: linePoints, borderColor: "#6ea8fe", borderWidth: 1.5, pointRadius: 0, tension: 0 },
+        { type: "scatter", label: "Price at Transaction", data: txPoint ? [txPoint] : [], backgroundColor: txColor, pointRadius: 6, pointHoverRadius: 8 },
+        { type: "scatter", label: "Price at Disclosure", data: discPoint ? [discPoint] : [], backgroundColor: "#f0b429", pointRadius: 6, pointHoverRadius: 8 },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "nearest", intersect: true },
+      scales: {
+        x: {
+          type: "linear", min: 0, max: series.length - 1,
+          ticks: { maxTicksLimit: 10, color: "#9aa3b2", callback: (v) => dates[Math.round(v)] || "" },
+          grid: { color: "#2a2f3a" },
+        },
+        y: { ticks: { color: "#9aa3b2" }, grid: { color: "#2a2f3a" } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: (items) => dates[Math.round(items[0].parsed.x)] || "",
+            label: (context) => context.datasetIndex === 0
+              ? `Price: $${context.parsed.y.toFixed(2)}`
+              : `${context.dataset.label}: $${context.parsed.y.toFixed(2)}`,
+          },
+        },
+      },
+    },
+  });
+
+  function setRange(rangeKey) {
+    const [startIndex, endIndex] = rangeKey === "all"
+      ? [0, series.length - 1]
+      : computeWindowIndices(dates, trade.transaction_date, 180);
+    const visiblePrices = prices.slice(startIndex, endIndex + 1);
+    const lo = Math.min(...visiblePrices), hi = Math.max(...visiblePrices);
+    const padding = (hi - lo) * 0.08 || hi * 0.08 || 1;
+
+    chart.options.scales.x.min = startIndex;
+    chart.options.scales.x.max = endIndex;
+    chart.options.scales.y.min = Math.max(0, lo - padding);
+    chart.options.scales.y.max = hi + padding;
+    chart.update();
+
+    controlsEl.querySelectorAll("button").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.range === rangeKey);
+    });
+  }
+
+  controlsEl.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", () => setRange(btn.dataset.range));
+  });
+
+  setRange("near");
+}
+
+function daysBetween(fromStr, toStr) {
+  const from = new Date(fromStr + "T00:00:00"), to = new Date(toStr + "T00:00:00");
+  return Math.round((to - from) / 86400000);
+}
+
+async function main() {
+  const params = new URLSearchParams(window.location.search);
+  const id = Number(params.get("id"));
+  const legislatorId = params.get("legislator");
+
+  const notFound = () => {
+    document.getElementById("loading").style.display = "none";
+    document.getElementById("not-found").style.display = "block";
+  };
+
+  if (!id || !legislatorId) return notFound();
+
+  const [legislators, tickers, latestPrices] = await Promise.all([
+    fetchJSON("data/legislators.json"),
+    fetchJSON("data/tickers.json"),
+    fetchJSON("data/latest_prices.json"),
+  ]);
+
+  const legislator = legislators.find((l) => String(l.id) === String(legislatorId));
+  if (!legislator) return notFound();
+
+  let trades = [];
+  try {
+    trades = await fetchJSON(`data/trades/${legislator.id}.json`);
+  } catch (e) {
+    trades = [];
+  }
+  const trade = trades.find((t) => t.id === id);
+  if (!trade) return notFound();
+
+  const assetName = trade.ticker ? (tickers[trade.ticker] || trade.ticker) : (trade.asset_name || "Unknown asset");
+  document.title = `${trade.ticker || assetName} — ${typeLabel(trade.transaction_type)} — Trade Detail`;
+  document.getElementById("trade-subtitle").innerHTML =
+    `<a href="politician.html?id=${legislator.id}">${escapeHtml(legislator.first_name)} ${escapeHtml(legislator.last_name)}</a>` +
+    ` · ${typeLabel(trade.transaction_type)} ` +
+    (trade.ticker
+      ? `<a href="ticker.html?ticker=${encodeURIComponent(trade.ticker)}">${escapeHtml(trade.ticker)}</a>`
+      : escapeHtml(assetName));
+
+  const priorTrades = trade.ticker
+    ? trades.filter((t) => t.ticker === trade.ticker && t.transaction_date < trade.transaction_date).length
+    : null;
+
+  const priceNow = trade.ticker && latestPrices[trade.ticker] ? latestPrices[trade.ticker].price : null;
+  const lagDays = daysBetween(trade.transaction_date, trade.notification_date);
+
+  let priceSeries = [];
+  if (trade.ticker) {
+    try {
+      priceSeries = await fetchJSON(`data/prices/${encodeURIComponent(trade.ticker)}.json`);
+    } catch (e) {
+      priceSeries = [];
+    }
+  }
+  const txResult = priceSeries.length > 0 ? priceOnOrAfter(priceSeries, trade.transaction_date) : null;
+
+  const stats = [
+    ["Ticker / Asset", trade.ticker
+      ? `<a href="ticker.html?ticker=${encodeURIComponent(trade.ticker)}">${escapeHtml(trade.ticker)}</a> — ${escapeHtml(assetName)}`
+      : escapeHtml(assetName)],
+    ["Type", `<span class="${typeClass(trade.transaction_type)}">${typeLabel(trade.transaction_type)}</span>`],
+    ["Amount", formatAmount(trade.amount_low, trade.amount_high)],
+    ["Owner", escapeHtml(trade.owner || "—")],
+    ["Transaction Date", formatDate(trade.transaction_date)],
+    ["Disclosed", formatDate(trade.notification_date)],
+    ["Filed", formatDate(trade.filing_date)],
+    ["Disclosure Lag", `${lagDays} day${lagDays === 1 ? "" : "s"}`],
+    ["Prior Trades in Ticker", priorTrades === null ? "—" : priorTrades],
+    ["Price at Transaction", formatPrice(txResult ? txResult[1] : null)],
+    ["Price at Disclosure", formatPrice(trade.price_at_notification)],
+    ["Price Today", formatPrice(priceNow)],
+  ];
+  document.getElementById("stats").innerHTML = stats.map(([label, value]) => `
+    <div class="stat"><div class="label">${escapeHtml(label)}</div><div class="value">${value}</div></div>
+  `).join("");
+
+  if (trade.comment) {
+    document.getElementById("comment-text").textContent = trade.comment;
+    document.getElementById("comment-section").style.display = "block";
+  }
+
+  document.getElementById("loading").style.display = "none";
+  document.getElementById("trade-content").style.display = "block";
+
+  if (!trade.ticker || priceSeries.length === 0) {
+    document.getElementById("no-chart").style.display = "block";
+    return;
+  }
+
+  renderTradeChart(
+    document.getElementById("price-chart"), document.getElementById("chart-controls"),
+    priceSeries, trade, txResult,
+  );
+  document.getElementById("chart-section").style.display = "block";
+}
+
+main();
+</script>
+</body>
+</html>

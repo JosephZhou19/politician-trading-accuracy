@@ -2,8 +2,8 @@ import pytest
 
 from src.db import models
 from scripts.export_website_data import (
-    build_exports, clean_comment, export_issuers, export_legislators, fetch_trade_rows,
-    _price_change_30d,
+    build_exports, clean_asset_name, clean_comment, export_issuers, export_legislators,
+    fetch_trade_rows, _price_change_30d,
 )
 
 _filing_counter = [0]
@@ -257,6 +257,56 @@ def test_export_issuers_aggregates_per_ticker(conn):
     assert nvda["last_traded"] == "2024-02-10"
     assert nvda["volume"] == pytest.approx(32_500.5 + 75_000.5)
     assert nvda["current_price"] == 500.0
+
+
+@pytest.mark.parametrize("raw,ticker,expected", [
+    ("Microsoft Corporation - Common Stock (MSFT) [ST]", "MSFT", "Microsoft Corporation"),
+    ("Johnson & Johnson Common Stock (JNJ) [ST]", "JNJ", "Johnson & Johnson"),
+    ("Walt Disney Company (DIS) [ST]", "DIS", "Walt Disney Company"),
+    ("AT&T Inc. (T) [ST]", "T", "AT&T Inc."),
+    ("NVIDIA Corporation - Common Stock", "NVDA", "NVIDIA Corporation"),
+    ("Intel Corp", "INTC", "Intel Corp"),
+    # A parenthetical that ISN'T the ticker must survive - confirmed live, "(The)" is part of
+    # the formal registered name for several real issuers, not a symbol to strip.
+    ("Williams Companies, Inc. (The) Common Stock", "WMB", "Williams Companies, Inc. (The)"),
+    # Class distinction is real, meaningful information (GOOG vs GOOGL) - only the ticker and
+    # type-tag get stripped, not every trailing qualifier.
+    ("Alphabet Inc. - Class C Capital Stock (GOOG) [ST]", "GOOG", "Alphabet Inc. - Class C Capital Stock"),
+])
+def test_clean_asset_name_strips_ticker_and_type_tag_boilerplate(raw, ticker, expected):
+    assert clean_asset_name(raw, ticker) == expected
+
+
+def test_clean_asset_name_falls_back_to_raw_name_if_stripping_empties_it():
+    assert clean_asset_name("(MSFT) [ST]", "MSFT") == "(MSFT) [ST]"
+
+
+def test_clean_asset_name_handles_none():
+    assert clean_asset_name(None, "MSFT") is None
+
+
+def test_export_issuers_excludes_non_stock_asset_types(conn):
+    """Confirmed live: ~1,300 tickers have a mix of typed and untyped trade rows for the
+    SAME underlying stock (an older filing just missing the asset_type field) - the filter
+    must drop individual non-stock ROWS, not the whole ticker, or real companies vanish from
+    the directory over one untyped row."""
+    leg_id, _ = _insert_trade(conn, ticker="MSFT", transaction_date="2024-01-05", asset_type="Stock")
+    _insert_trade(
+        conn, ticker="MSFT", transaction_date="2024-02-05", asset_type=None,
+        legislator=("Josh", "Gottheimer", "house"),
+    )
+    _insert_trade(conn, ticker="MMLP", transaction_date="2024-01-05", asset_type="Corporate Bond")
+
+    rows = fetch_trade_rows(conn)
+    _, trades_by_ticker, _, tickers, latest_prices, price_series = build_exports(
+        conn, rows, {leg_id: "Nancy Pelosi"},
+    )
+
+    issuers = export_issuers(trades_by_ticker, tickers, latest_prices, price_series)
+
+    [msft] = [i for i in issuers if i["ticker"] == "MSFT"]
+    assert msft["trade_count"] == 1  # only the "Stock"-typed row counts
+    assert "MMLP" not in {i["ticker"] for i in issuers}  # no stock-typed row at all
 
 
 def test_export_issuers_defaults_to_most_traded_first(conn):

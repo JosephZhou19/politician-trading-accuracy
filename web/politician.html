@@ -23,31 +23,171 @@
 
   <div class="stat-row" id="stats"></div>
 
+  <section id="timeline-section" style="display:none">
+    <h2>Activity Over Time</h2>
+    <div class="chart-wrap"><canvas id="timeline-chart"></canvas></div>
+    <p class="muted" id="timeline-legend">
+      <span class="dot buy"></span> Buy &nbsp; <span class="dot sell"></span> Sell &nbsp;
+      <span class="dot exchange"></span> Exchange
+    </p>
+  </section>
+
+  <section id="positions-section" style="display:none">
+    <h2>Positions</h2>
+    <p class="muted">
+      Every distinct ticker this member has disclosed buying or selling, collapsed into one
+      row - so a name repeatedly bought over dozens of filings (e.g. a managed account's
+      recurring purchases) shows as one position, not dozens of line items. "Net $" is buys
+      minus sells using each disclosed amount range's midpoint - an approximation, not an
+      exact holding value, since STOCK Act filings only report ranges.
+    </p>
+    <div class="feed-panel">
+      <table id="positions-table">
+        <colgroup>
+          <col style="width:20%"><col style="width:12%"><col style="width:12%">
+          <col style="width:22%"><col style="width:17%"><col style="width:17%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th data-sort="ticker">Ticker</th>
+            <th data-sort="buys">Buys</th>
+            <th data-sort="sells">Sells</th>
+            <th data-sort="net">Net $ (approx.)</th>
+            <th data-sort="first">First Trade</th>
+            <th data-sort="last">Last Trade</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
   <section>
     <h2>Disclosed Trades</h2>
+    <p class="muted">Click a trade for its full detail, including price at transaction, price at disclosure, and a chart.</p>
     <div id="loading" class="loading">Loading…</div>
     <div id="not-found" class="empty" style="display:none">No member found for this ID.</div>
-    <table id="trades-table" style="display:none">
-      <thead>
-        <tr>
-          <th data-sort="ticker">Ticker</th>
-          <th>Details</th>
-          <th data-sort="type">Type</th>
-          <th data-sort="amount">Amount</th>
-          <th data-sort="txdate">Transaction Date</th>
-          <th data-sort="notdate">Disclosed</th>
-          <th data-sort="owner">Owner</th>
-          <th data-sort="priceat">Price at Disclosure</th>
-          <th data-sort="pricenow">Price Today</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
+    <div class="feed-panel" id="trades-panel" style="display:none">
+      <table id="trades-table">
+        <colgroup>
+          <col style="width:8%"><col style="width:36%"><col style="width:10%">
+          <col style="width:16%"><col style="width:15%"><col style="width:15%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th data-sort="ticker">Ticker</th>
+            <th>Details</th>
+            <th data-sort="type">Type</th>
+            <th data-sort="amount">Amount</th>
+            <th data-sort="txdate">Transaction Date</th>
+            <th data-sort="notdate">Disclosed</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </section>
 </main>
 <footer>Data source: public House/Senate STOCK Act filings.</footer>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script src="app.js"></script>
 <script>
+// Buckets every disclosed trade (buy/sell/exchange) into its transaction year and renders a
+// stacked bar chart - zero-filled across the member's full first-to-last year range, not just
+// years that happen to have trades, so a long quiet stretch reads as a real gap rather than
+// being silently skipped.
+function renderTimeline(canvas, trades) {
+  const years = trades.map((t) => Number(t.transaction_date.slice(0, 4)));
+  const minYear = Math.min(...years), maxYear = Math.max(...years);
+  const labels = [];
+  for (let y = minYear; y <= maxYear; y++) labels.push(y);
+
+  const buys = labels.map(() => 0), sells = labels.map(() => 0), exchanges = labels.map(() => 0);
+  for (const t of trades) {
+    const idx = Number(t.transaction_date.slice(0, 4)) - minYear;
+    if (t.transaction_type === "purchase") buys[idx]++;
+    else if (t.transaction_type.startsWith("sale")) sells[idx]++;
+    else exchanges[idx]++;
+  }
+
+  new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        { label: "Buy", data: buys, backgroundColor: "#4caf6a", stack: "s" },
+        { label: "Sell", data: sells, backgroundColor: "#e06b6b", stack: "s" },
+        { label: "Exchange", data: exchanges, backgroundColor: "#9aa3b2", stack: "s" },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { stacked: true, ticks: { color: "#9aa3b2" }, grid: { display: false } },
+        y: { stacked: true, beginAtZero: true, ticks: { color: "#9aa3b2", precision: 0 }, grid: { color: "#2a2f3a" } },
+      },
+      plugins: { legend: { display: false } },
+    },
+  });
+}
+
+// Collapses every trade in a real, tradeable ticker into one row per ticker - a position
+// bought in 40 separate filings should read as one row, not 40. Ticker-less disclosures
+// (private funds, bonds, foreign securities with no resolvable ticker) are left out entirely
+// rather than grouped by asset_name text, which is free-form and not a stable identity the
+// way a ticker is - they're still visible in the raw Disclosed Trades table below. "Net $"
+// sums each disclosed amount range's MIDPOINT, buys minus sells - an approximation (STOCK Act
+// filings only ever give a range, never an exact amount), not an exact position size.
+function computePositions(trades, tickers) {
+  const groups = new Map();
+  for (const t of trades) {
+    if (!t.ticker) continue;
+    if (!groups.has(t.ticker)) {
+      groups.set(t.ticker, {
+        ticker: t.ticker,
+        label: tickers[t.ticker] || t.ticker,
+        buys: 0, sells: 0, netApprox: 0,
+        first: t.transaction_date, last: t.transaction_date,
+      });
+    }
+    const g = groups.get(t.ticker);
+    const mid = (t.amount_low + (t.amount_high ?? t.amount_low)) / 2;
+    if (t.transaction_type === "purchase") { g.buys++; g.netApprox += mid; }
+    else if (t.transaction_type.startsWith("sale")) { g.sells++; g.netApprox -= mid; }
+    if (t.transaction_date < g.first) g.first = t.transaction_date;
+    if (t.transaction_date > g.last) g.last = t.transaction_date;
+  }
+  // Largest dollar position first (by the same Net $ figure the table displays), not most
+  // trades first - a position built or exited in a few large filings should rank above one
+  // with more, smaller trades.
+  return Array.from(groups.values()).sort((a, b) => Math.abs(b.netApprox) - Math.abs(a.netApprox));
+}
+
+function formatNetApprox(n) {
+  const sign = n >= 0 ? "+" : "-";
+  return `${sign}$${Math.round(Math.abs(n)).toLocaleString("en-US")}`;
+}
+
+function renderPositions(positions) {
+  const tbody = document.querySelector("#positions-table tbody");
+  tbody.innerHTML = positions.map((p) => `
+    <tr>
+      <td data-sort-value="${escapeHtml(p.ticker)}" title="${escapeHtml(p.label)}">
+        <a href="ticker.html?ticker=${encodeURIComponent(p.ticker)}">${escapeHtml(p.ticker)}</a>
+      </td>
+      <td data-sort-value="${p.buys}">${p.buys}</td>
+      <td data-sort-value="${p.sells}">${p.sells}</td>
+      <td data-sort-value="${p.netApprox}" class="${p.netApprox >= 0 ? "type-purchase" : "type-sale_full"}">
+        ${formatNetApprox(p.netApprox)}
+      </td>
+      <td data-sort-value="${p.first}">${formatDate(p.first)}</td>
+      <td data-sort-value="${p.last}">${formatDate(p.last)}</td>
+    </tr>
+  `).join("");
+  makeSortable(document.getElementById("positions-table"));
+}
+
 async function main() {
   const params = new URLSearchParams(window.location.search);
   const id = params.get("id");
@@ -89,7 +229,6 @@ async function main() {
 
   const tbody = document.querySelector("#trades-table tbody");
   tbody.innerHTML = trades.map((t) => {
-    const priceNow = t.ticker && latestPrices[t.ticker] ? latestPrices[t.ticker].price : null;
     const assetName = t.ticker ? (tickers[t.ticker] || t.ticker) : (t.asset_name || "—");
     return `
       <tr>
@@ -101,9 +240,6 @@ async function main() {
         <td data-sort-value="${t.amount_low}">${formatAmount(t.amount_low, t.amount_high)}</td>
         <td data-sort-value="${t.transaction_date}">${formatDate(t.transaction_date)}</td>
         <td data-sort-value="${t.notification_date}">${formatDate(t.notification_date)}</td>
-        <td data-sort-value="${escapeHtml(t.owner || "")}">${escapeHtml(t.owner || "—")}</td>
-        <td data-sort-value="${t.price_at_notification ?? ""}">${formatPrice(t.price_at_notification)}</td>
-        <td data-sort-value="${priceNow ?? ""}">${formatPrice(priceNow)}</td>
       </tr>
     `;
   }).join("");
@@ -113,8 +249,15 @@ async function main() {
     document.getElementById("not-found").textContent = "No disclosed trades found.";
     document.getElementById("not-found").style.display = "block";
   } else {
-    document.getElementById("trades-table").style.display = "table";
+    document.getElementById("trades-panel").style.display = "block";
     makeSortable(document.getElementById("trades-table"));
+    makeRowsClickable(tbody, (i) => `trade.html?id=${trades[i].id}&legislator=${legislator.id}`);
+
+    renderTimeline(document.getElementById("timeline-chart"), trades);
+    document.getElementById("timeline-section").style.display = "block";
+
+    renderPositions(computePositions(trades, tickers));
+    document.getElementById("positions-section").style.display = "block";
   }
 }
 

@@ -198,7 +198,10 @@ a:hover { text-decoration: underline; }
   border-radius: 8px;
 }
 
-.feed-panel table { font-size: 0.86rem; }
+.feed-panel table {
+  font-size: 0.86rem;
+  table-layout: fixed;
+}
 
 .feed-panel thead th {
   position: sticky;
@@ -208,6 +211,13 @@ a:hover { text-decoration: underline; }
 }
 
 .feed-panel tbody tr:last-child td { border-bottom: none; }
+
+.feed-panel td, .feed-panel th {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-link { cursor: pointer; }
 
 .chart-wrap {
   background: var(--panel);
@@ -228,6 +238,8 @@ a:hover { text-decoration: underline; }
 
 .dot.buy { background: var(--buy); }
 .dot.sell { background: var(--sell); }
+.dot.exchange { background: var(--muted); }
+.dot.disclosure { background: #f0b429; }
 
 .range-buttons {
   display: flex;

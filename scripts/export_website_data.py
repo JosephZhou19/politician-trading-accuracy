@@ -84,6 +84,29 @@ def clean_comment(comment: str | None) -> str | None:
     return cleaned or None
 
 
+# Raw disclosed asset names carry filing boilerplate that's redundant once the ticker is
+# already shown next to the name everywhere on the site - e.g. "Microsoft Corporation -
+# Common Stock (MSFT) [ST]" is just "Microsoft Corporation" once the "(MSFT)" and "[ST]" are
+# dropped. Order matters: the asset-type tag is always the very last bracketed token, so it's
+# stripped first, then the ticker-in-parens (only when it actually matches this row's own
+# ticker - a different parenthetical, e.g. "Williams Companies, Inc. (The)", must survive),
+# then a trailing "Common Stock" label. Confirmed live against the real exported names before
+# landing on this exact order - stripping the ticker before the type tag would leave a
+# dangling "[ST]" behind in several real cases.
+_ASSET_TYPE_TAG_RE = re.compile(r"\s*\[\w+\]\s*$")
+_TRAILING_COMMON_STOCK_RE = re.compile(r"\s*-?\s*Common Stock\s*$", re.IGNORECASE)
+
+
+def clean_asset_name(name: str | None, ticker: str | None) -> str | None:
+    if not name:
+        return name
+    cleaned = _ASSET_TYPE_TAG_RE.sub("", name)
+    if ticker:
+        cleaned = re.sub(rf"\s*\({re.escape(ticker)}\)\s*$", "", cleaned)
+    cleaned = _TRAILING_COMMON_STOCK_RE.sub("", cleaned)
+    return cleaned.strip() or name
+
+
 # Same scope campaigns.py uses for "can we actually price this" - a real ticker and an
 # asset type where the ticker is the priceable instrument (options priced via the
 # underlying, same convention as the rest of this project).
@@ -133,7 +156,7 @@ def build_exports(conn, rows, legislator_names: dict[int, str]):
     all_trades: list[dict] = []
     for r in rows:
         if r["ticker"] and r["ticker"] not in tickers:
-            tickers[r["ticker"]] = r["asset_name"]
+            tickers[r["ticker"]] = clean_asset_name(r["asset_name"], r["ticker"])
 
         price_at_notification = None
         price_date = None
@@ -152,7 +175,7 @@ def build_exports(conn, rows, legislator_names: dict[int, str]):
             "ticker": r["ticker"],
             # Only carried per-row for ticker-less trades - a real ticker's name already
             # lives once in tickers.json, no need to repeat it on every row.
-            "asset_name": r["asset_name"] if not r["ticker"] else None,
+            "asset_name": clean_asset_name(r["asset_name"], None) if not r["ticker"] else None,
             "asset_type": r["asset_type"],
             "transaction_type": r["transaction_type"],
             "transaction_date": r["transaction_date"],
@@ -234,15 +257,28 @@ def _price_change_30d(price_series: list[list]) -> float | None:
     return (price_series[-1][1] - start_price) / start_price
 
 
+#: Issuers directory scope, narrower than PRICEABLE_ASSET_TYPES on purpose - this listing is
+#: meant to read as "companies," so options (OP) are excluded even though they're priced via
+#: the underlying elsewhere on the site. Trade-level filter, not ticker-level: a ticker with
+#: some untyped/bond/ETF rows and at least one real stock row still qualifies, counted only by
+#: its stock rows - confirmed live that ~1,300 tickers have a mix of typed and untyped trades
+#: for the exact same underlying stock (an older filing just missing the field), so filtering
+#: out the whole TICKER on one untyped row would wrongly drop real companies.
+ISSUER_ASSET_TYPES = ("ST", "Stock")
+
+
 def export_issuers(
     trades_by_ticker: dict[str, list[dict]], tickers: dict[str, str],
     latest_prices: dict[str, dict], price_series: dict[str, list[list]],
 ) -> list[dict]:
-    """One row per actually-traded ticker - the issuer-side equivalent of
+    """One row per actually-traded stock ticker - the issuer-side equivalent of
     export_legislators. Default order is most-disclosed-trades first, same reasoning as the
     legislator directory."""
     issuers = []
-    for ticker, trades in trades_by_ticker.items():
+    for ticker, all_trades in trades_by_ticker.items():
+        trades = [t for t in all_trades if t["asset_type"] in ISSUER_ASSET_TYPES]
+        if not trades:
+            continue
         volume = sum((t["amount_low"] + (t["amount_high"] or t["amount_low"])) / 2 for t in trades)
         series = price_series.get(ticker)
         issuers.append({
