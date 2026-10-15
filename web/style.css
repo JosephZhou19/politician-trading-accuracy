@@ -277,6 +277,13 @@ a:hover { text-decoration: underline; }
 .feed-panel table {
   font-size: 0.86rem;
   table-layout: fixed;
+  /* table-layout:fixed makes the table exactly as wide as its container (.feed-panel) at any
+     viewport size, so on a narrow screen every percentage-width <col> shrinks proportionally
+     right along with it - the table never actually exceeds .feed-panel's width, so its
+     overflow-x:auto never has anything to scroll, and columns just get crushed down to
+     ellipsis. A min-width keeps the columns at a readable floor so .feed-panel scrolls
+     horizontally instead. */
+  min-width: 700px;
 }
 
 .feed-panel thead th {
@@ -366,4 +373,16 @@ footer {
 
   table { font-size: 0.82rem; }
   th, td { padding: 7px 8px; }
+
+  /* .site-search-results is normally right:0 within .site-search and wider than it (300px vs
+     a 240px box) - fine on desktop where .site-search sits well clear of the header's left
+     edge, but on mobile nav.site-nav wraps and .site-search lands flush against the left
+     padding, so right-anchoring pushes the dropdown's extra width off the left edge of the
+     viewport entirely. Matching its bounds to the input itself keeps it on-screen. */
+  .site-search-results {
+    left: 0;
+    right: 0;
+    width: auto;
+    max-width: none;
+  }
 }
