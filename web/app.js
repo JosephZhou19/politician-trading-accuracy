@@ -144,3 +144,108 @@ function makeSortable(table) {
     });
   });
 }
+
+// Site-wide header search (#site-search-input / #site-search-results in every page's <header>)
+// - lets a visitor jump straight to any politician or ticker from any page, not just
+// index.html's own member search or issuers.html's own issuer search. Loads
+// legislators.json + tickers.json lazily, on first keystroke, not on every page load - most
+// page views never touch the search box, so there's no point paying for 2 extra fetches on
+// every single visit just in case someone uses it.
+let _siteSearchDataPromise = null;
+function loadSiteSearchData() {
+  if (!_siteSearchDataPromise) {
+    _siteSearchDataPromise = Promise.all([
+      fetchJSON("data/legislators.json"),
+      fetchJSON("data/tickers.json"),
+    ]).then(([legislators, tickers]) => ({ legislators, tickers }));
+  }
+  return _siteSearchDataPromise;
+}
+
+const SITE_SEARCH_MAX_RESULTS = 8;
+
+function siteSearchMatches(data, query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const results = [];
+  for (const l of data.legislators) {
+    const name = `${l.first_name} ${l.last_name}`;
+    if (name.toLowerCase().includes(q)) {
+      results.push({ type: "Member", label: name, sub: chamberLabel(l.chamber), href: `politician.html?id=${l.id}` });
+    }
+  }
+  for (const [ticker, name] of Object.entries(data.tickers)) {
+    if (ticker.toLowerCase().includes(q) || (name && name.toLowerCase().includes(q))) {
+      results.push({ type: "Ticker", label: ticker, sub: name || "", href: `ticker.html?ticker=${encodeURIComponent(ticker)}` });
+    }
+  }
+  // A match at the start of the label (e.g. "Nancy" in "Nancy Pelosi", "AAP" in "AAPL") is
+  // almost always what the visitor meant more than a mid-string match - rank those first,
+  // stable order within each group otherwise.
+  results.sort((a, b) => {
+    const aStarts = a.label.toLowerCase().startsWith(q) ? 0 : 1;
+    const bStarts = b.label.toLowerCase().startsWith(q) ? 0 : 1;
+    return aStarts - bStarts;
+  });
+  return results.slice(0, SITE_SEARCH_MAX_RESULTS);
+}
+
+function initSiteSearch() {
+  const input = document.getElementById("site-search-input");
+  const resultsEl = document.getElementById("site-search-results");
+  if (!input || !resultsEl) return;
+
+  let currentData = null;
+  let currentResults = [];
+
+  function renderResults(list) {
+    currentResults = list;
+    if (list.length === 0) {
+      resultsEl.innerHTML = input.value.trim() ? `<div class="no-results">No matches</div>` : "";
+    } else {
+      resultsEl.innerHTML = list.map((r) => `
+        <a href="${r.href}">
+          <span>${escapeHtml(r.label)}${r.sub ? ` <span class="muted">— ${escapeHtml(r.sub)}</span>` : ""}</span>
+          <span class="result-type">${r.type}</span>
+        </a>
+      `).join("");
+    }
+    resultsEl.classList.toggle("open", input.value.trim().length > 0);
+  }
+
+  input.addEventListener("input", async () => {
+    if (!input.value.trim()) { renderResults([]); return; }
+    if (!currentData) {
+      try {
+        currentData = await loadSiteSearchData();
+      } catch (e) {
+        resultsEl.innerHTML = `<div class="no-results">Search unavailable</div>`;
+        resultsEl.classList.add("open");
+        return;
+      }
+      // The fetch is async - the visitor may have already changed or cleared the box by the
+      // time it resolves, so re-check instead of rendering results for a stale query.
+      if (!input.value.trim()) { renderResults([]); return; }
+    }
+    renderResults(siteSearchMatches(currentData, input.value));
+  });
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && currentResults.length > 0) {
+      window.location.href = currentResults[0].href;
+    } else if (e.key === "Escape") {
+      input.blur();
+      resultsEl.classList.remove("open");
+    }
+  });
+
+  input.addEventListener("focus", () => {
+    if (input.value.trim()) resultsEl.classList.add("open");
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".site-search")) resultsEl.classList.remove("open");
+  });
+}
+
+initSiteSearch();
