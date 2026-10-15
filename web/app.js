@@ -210,7 +210,11 @@ function initSiteSearch() {
         </a>
       `).join("");
     }
-    resultsEl.classList.toggle("open", input.value.trim().length > 0);
+    // Gated on the input still being focused, not just non-empty - loadSiteSearchData's
+    // fetch is async, so this can resolve after the visitor has already clicked away (e.g.
+    // navigated via a different link while the search data was still loading); without this
+    // check the dropdown would pop back open over whatever they've moved on to.
+    resultsEl.classList.toggle("open", document.activeElement === input && input.value.trim().length > 0);
   }
 
   input.addEventListener("input", async () => {
@@ -219,8 +223,13 @@ function initSiteSearch() {
       try {
         currentData = await loadSiteSearchData();
       } catch (e) {
+        // Don't let one failed attempt (e.g. a dropped connection) permanently disable
+        // search for the rest of the page's lifetime - _siteSearchDataPromise is a module-
+        // level cache shared by every call, so a rejected promise left in place would make
+        // every future keystroke fail the same way with no way to recover short of a reload.
+        _siteSearchDataPromise = null;
         resultsEl.innerHTML = `<div class="no-results">Search unavailable</div>`;
-        resultsEl.classList.add("open");
+        resultsEl.classList.toggle("open", document.activeElement === input);
         return;
       }
       // The fetch is async - the visitor may have already changed or cleared the box by the
@@ -241,6 +250,20 @@ function initSiteSearch() {
 
   input.addEventListener("focus", () => {
     if (input.value.trim()) resultsEl.classList.add("open");
+  });
+
+  // Delayed rather than instant: a click on a result fires `blur` (focus leaving the input)
+  // before the click event itself - closing the dropdown synchronously here would hide the
+  // link out from under the in-progress click on some browsers. 150ms is long enough for a
+  // real click to land first, short enough that leaving via Tab (which never fires a click)
+  // still closes it promptly instead of leaving it floating over whatever's focused next.
+  input.addEventListener("blur", () => {
+    // Re-check focus when the timeout actually fires, not just when it's scheduled - a quick
+    // blur-then-refocus (e.g. clicking back into the box within the delay window) must not
+    // have this stale timeout yank the dropdown closed out from under the new focus.
+    setTimeout(() => {
+      if (document.activeElement !== input) resultsEl.classList.remove("open");
+    }, 150);
   });
 
   document.addEventListener("click", (e) => {
