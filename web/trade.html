@@ -4,6 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Trade Detail</title>
+<meta name="description" content="Detail of a single congressional trade disclosure filed under the STOCK Act.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Congressional Trade Disclosures">
+<meta property="og:title" content="Trade Detail">
+<meta property="og:description" content="Detail of a single congressional trade disclosure filed under the STOCK Act.">
+<meta property="og:url" content="https://josephzhou19.github.io/politician-trading-accuracy/trade.html">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Trade Detail">
+<meta name="twitter:description" content="Detail of a single congressional trade disclosure filed under the STOCK Act.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -196,7 +206,10 @@ async function main() {
   if (!trade) return notFound();
 
   const assetName = trade.ticker ? (tickers[trade.ticker] || trade.ticker) : (trade.asset_name || "Unknown asset");
-  document.title = `${trade.ticker || assetName} — ${typeLabel(trade.transaction_type)} — Trade Detail`;
+  updatePageMeta(
+    `${trade.ticker || assetName} — ${typeLabel(trade.transaction_type)} — Trade Detail`,
+    `${typeLabel(trade.transaction_type)} of ${assetName} disclosed by ${legislator.first_name} ${legislator.last_name} under the STOCK Act.`
+  );
   document.getElementById("trade-subtitle").innerHTML =
     `<a href="politician.html?id=${legislator.id}">${escapeHtml(legislator.first_name)} ${escapeHtml(legislator.last_name)}</a>` +
     ` · ${typeLabel(trade.transaction_type)} ` +

@@ -4,6 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Member Trade Disclosures</title>
+<meta name="description" content="Trade disclosures filed by a member of the U.S. House or Senate under the STOCK Act.">
+<meta property="og:type" content="profile">
+<meta property="og:site_name" content="Congressional Trade Disclosures">
+<meta property="og:title" content="Member Trade Disclosures">
+<meta property="og:description" content="Trade disclosures filed by a member of the U.S. House or Senate under the STOCK Act.">
+<meta property="og:url" content="https://josephzhou19.github.io/politician-trading-accuracy/politician.html">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Member Trade Disclosures">
+<meta name="twitter:description" content="Trade disclosures filed by a member of the U.S. House or Senate under the STOCK Act.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -219,7 +229,11 @@ async function main() {
     return;
   }
 
-  document.title = `${legislator.first_name} ${legislator.last_name} — Trade Disclosures`;
+  updatePageMeta(
+    `${legislator.first_name} ${legislator.last_name} — Trade Disclosures`,
+    `STOCK Act trade disclosures filed by ${legislator.first_name} ${legislator.last_name}` +
+      (legislator.state ? `, ${chamberLabel(legislator.chamber)} member from ${legislator.state}` : "") + "."
+  );
   const partyState = [legislator.party, legislator.state].filter(Boolean).join(" · ");
   document.getElementById("member-subtitle").textContent =
     `${legislator.first_name} ${legislator.last_name} · ${chamberLabel(legislator.chamber)}` +

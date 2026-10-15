@@ -28,6 +28,25 @@ function showLoadError(el, detail) {
   el.style.display = "block";
 }
 
+// Dynamic pages (politician/ticker/trade) serve a generic fallback title/description/OG tags
+// from static HTML, since the real member/ticker/trade isn't known until the query-string id
+// resolves against fetched JSON - call this once it has, to make the tab title, link previews,
+// and the URL in og:url (which otherwise wouldn't carry the page's query string) all match
+// what's actually showing.
+function updatePageMeta(title, description) {
+  document.title = title;
+  const og = (prop) => document.querySelector(`meta[property="${prop}"]`);
+  const tw = (name) => document.querySelector(`meta[name="${name}"]`);
+  if (og("og:title")) og("og:title").setAttribute("content", title);
+  if (tw("twitter:title")) tw("twitter:title").setAttribute("content", title);
+  if (description) {
+    if (tw("description")) tw("description").setAttribute("content", description);
+    if (og("og:description")) og("og:description").setAttribute("content", description);
+    if (tw("twitter:description")) tw("twitter:description").setAttribute("content", description);
+  }
+  if (og("og:url")) og("og:url").setAttribute("content", window.location.href);
+}
+
 async function fetchJSON(path) {
   // no-store, not just a reload: the export reruns once a day and a visitor's browser
   // otherwise has no signal that e.g. data/trades/564.json changed since their last visit
