@@ -23,6 +23,24 @@ sustained block (which often shows up as yfinance quietly returning empty result
 indistinguishable from "ticker doesn't exist") must not get silently misread as thousands of
 real tickers suddenly having no data - see CONSECUTIVE_NO_DATA_CIRCUIT_BREAKER.
 
+--use-stockanalysis-fallback (opt-in, one-time-backfill use only - same as the old, now-
+deleted backfill_prices.py's flag): for a ticker yfinance has NO data for at all (fully
+delisted/acquired, not just recently), tries stockanalysis.com's undocumented history API
+before giving up on it. Since a ticker with any stored rows at all is already skipped via
+already_done above, re-running with this flag naturally only touches the still-empty
+backlog - no separate ticker list needed. Recovers a real, if small, slice of the gap (the
+point-price backfill's own run of this fallback recovered 17 of 1,089 fully-dead tickers) -
+most of the backlog is genuinely gone even from stockanalysis.com, not a bug in the fallback
+itself. Not used by update_ticker_daily_prices.py's recurring pass.
+
+Important when combining the two: CONSECUTIVE_NO_DATA_CIRCUIT_BREAKER assumes most tickers
+in a run DO have data (true for the normal full backfill, ~75% success rate) - a rerun
+scoped to the already-known-empty backlog inverts that (most of it is expected to fail even
+with the fallback on, based on the point-price version's own 17/1,089 recovery rate), so the
+default threshold will falsely trip almost immediately, mistaking the expected high failure
+rate for a rate-limit block. Pass a much higher --circuit-breaker-threshold (0 disables it
+entirely) when running this backlog-clearing pass specifically.
+
 Usage:
     python -m scripts.backfill_ticker_daily_prices --db data/congress_trades.db
 """
@@ -35,7 +53,7 @@ import time
 from dotenv import load_dotenv
 
 from src.db import models
-from src.market.prices import fetch_ticker_history
+from src.market.prices import fetch_ticker_history, fetch_ticker_history_stockanalysis
 
 load_dotenv()
 
@@ -67,7 +85,10 @@ def _rotate_to_resume_point(tickers, cursor):
     return tickers[start_idx:] + tickers[:start_idx]
 
 
-def backfill_ticker_daily_prices(conn, ticker_limit=None, time_budget_minutes=DEFAULT_TIME_BUDGET_MINUTES):
+def backfill_ticker_daily_prices(
+    conn, ticker_limit=None, time_budget_minutes=DEFAULT_TIME_BUDGET_MINUTES,
+    use_stockanalysis_fallback=False, circuit_breaker_threshold=CONSECUTIVE_NO_DATA_CIRCUIT_BREAKER,
+):
     cursor = models.get_daily_price_backfill_cursor(conn)
     tickers = _rotate_to_resume_point(models.get_all_traded_tickers(conn), cursor)
     already_done = models.get_latest_daily_price_dates(conn, tickers)
@@ -79,7 +100,10 @@ def backfill_ticker_daily_prices(conn, ticker_limit=None, time_budget_minutes=DE
     today = datetime.date.today()
     deadline = time.monotonic() + time_budget_minutes * 60 if time_budget_minutes else None
 
-    summary = {"tickers_checked": 0, "tickers_no_data": 0, "days_written": 0, "circuit_breaker_tripped": False}
+    summary = {
+        "tickers_checked": 0, "tickers_no_data": 0, "tickers_via_fallback": 0,
+        "days_written": 0, "circuit_breaker_tripped": False,
+    }
     print(f"{len(tickers)} ticker(s) still need a full history backfill"
           + (f" (resuming after {cursor!r})." if cursor else "."))
 
@@ -100,10 +124,28 @@ def backfill_ticker_daily_prices(conn, ticker_limit=None, time_budget_minutes=DE
         time.sleep(REQUEST_DELAY_SECONDS)
         summary["tickers_checked"] += 1
 
+        used_fallback = False
+        if history is None and use_stockanalysis_fallback:
+            try:
+                history = fetch_ticker_history_stockanalysis(ticker)
+            except Exception as e:
+                # Same reasoning as the primary fetch's try/except above - confirmed this
+                # actually happens live (an unconvertible pre-1970 timestamp on some tickers
+                # crashed the whole run before this guard existed, and the fallback's own
+                # try/except doesn't cover every possible failure mode of a live HTTP API).
+                logger.warning("Skipping %s's stockanalysis.com fallback this run - failed: %r", ticker, e)
+                history = None
+            time.sleep(REQUEST_DELAY_SECONDS)
+            used_fallback = history is not None
+
         if history is None:
             summary["tickers_no_data"] += 1
             consecutive_no_data += 1
         else:
+            if used_fallback:
+                print(f"{ticker}: recovered via stockanalysis.com fallback (Close, not Open) "
+                      f"- yfinance has no data for this ticker at all.")
+                summary["tickers_via_fallback"] += 1
             prices = [(date.isoformat(), price) for date, price in history.daily_prices()]
             models.set_ticker_daily_prices(conn, ticker, prices, commit=True)
             summary["days_written"] += len(prices)
@@ -112,7 +154,7 @@ def backfill_ticker_daily_prices(conn, ticker_limit=None, time_budget_minutes=DE
         last_ticker = ticker
         models.set_daily_price_backfill_cursor(conn, ticker)
 
-        if consecutive_no_data >= CONSECUTIVE_NO_DATA_CIRCUIT_BREAKER:
+        if circuit_breaker_threshold and consecutive_no_data >= circuit_breaker_threshold:
             print(f"{consecutive_no_data} ticker(s) in a row came back with no data - this "
                   f"looks like a yfinance rate-limit block, not {consecutive_no_data} "
                   f"coincidentally-dead tickers. Stopping early rather than mislabeling the "
@@ -139,6 +181,19 @@ def main():
         help="Stop and save the resume cursor after this long (0 to disable and run to completion)",
     )
     parser.add_argument(
+        "--use-stockanalysis-fallback", action="store_true",
+        help="For tickers yfinance has no data for at all, try stockanalysis.com's "
+             "undocumented history API (Close price, not Open). One-time backfill use only "
+             "- not intended for the recurring daily catch-up job.",
+    )
+    parser.add_argument(
+        "--circuit-breaker-threshold", type=int, default=CONSECUTIVE_NO_DATA_CIRCUIT_BREAKER,
+        help="Stop early after this many consecutive no-data tickers (0 disables it). Raise "
+             "this or set it to 0 when using --use-stockanalysis-fallback to clear the "
+             "already-known-empty backlog, where most tickers are expected to fail even "
+             "with the fallback on - see the module docstring.",
+    )
+    parser.add_argument(
         "--local", action="store_true",
         help="Run against the local mirror file at --db, ignoring TURSO_DATABASE_URL/"
              "TURSO_AUTH_TOKEN even if set - avoids per-row Turso round-trip latency during "
@@ -154,6 +209,8 @@ def main():
     summary = backfill_ticker_daily_prices(
         conn, ticker_limit=args.ticker_limit,
         time_budget_minutes=args.time_budget_minutes or None,
+        use_stockanalysis_fallback=args.use_stockanalysis_fallback,
+        circuit_breaker_threshold=args.circuit_breaker_threshold,
     )
     print(f"\nDone: {summary}")
 

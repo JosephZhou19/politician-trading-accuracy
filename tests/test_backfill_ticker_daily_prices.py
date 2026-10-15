@@ -151,6 +151,88 @@ def test_backfill_circuit_breaker_trips_on_a_long_run_of_no_data(conn):
     assert summary["tickers_checked"] < len(tickers)
 
 
+def test_backfill_falls_back_to_stockanalysis_when_yfinance_has_no_data(conn):
+    _insert_trade(conn, "HBI", "2020-01-05")
+
+    with patch("scripts.backfill_ticker_daily_prices.fetch_ticker_history", return_value=None), patch(
+        "scripts.backfill_ticker_daily_prices.fetch_ticker_history_stockanalysis",
+        return_value=_fake_history([(datetime.date(2020, 1, 5), 12.5)]),
+    ) as mock_fallback:
+        summary = backfill_ticker_daily_prices(conn, use_stockanalysis_fallback=True)
+
+    mock_fallback.assert_called_once_with("HBI")
+    assert summary["tickers_via_fallback"] == 1
+    assert summary["tickers_no_data"] == 0
+    assert summary["days_written"] == 1
+    rows = conn.execute("SELECT date, price FROM ticker_daily_prices WHERE ticker = 'HBI'").fetchall()
+    assert [(r["date"], r["price"]) for r in rows] == [("2020-01-05", 12.5)]
+
+
+def test_backfill_fallback_not_attempted_unless_flag_is_set(conn):
+    _insert_trade(conn, "HBI", "2020-01-05")
+
+    with patch("scripts.backfill_ticker_daily_prices.fetch_ticker_history", return_value=None), patch(
+        "scripts.backfill_ticker_daily_prices.fetch_ticker_history_stockanalysis"
+    ) as mock_fallback:
+        summary = backfill_ticker_daily_prices(conn)
+
+    mock_fallback.assert_not_called()
+    assert summary["tickers_no_data"] == 1
+    assert summary["tickers_via_fallback"] == 0
+
+
+def test_backfill_catches_a_fallback_exception_and_continues(conn):
+    """Defense in depth alongside prices.py's own fix for the real pre-1970-timestamp crash
+    this session: even if the fallback raises for some other unanticipated reason, one
+    ticker's fallback failure must not crash the whole run, same as the primary fetch."""
+    _insert_trade(conn, "ALE", "2020-01-05")
+    _insert_trade(conn, "MSFT", "2020-01-05")
+
+    def fake_fallback(ticker):
+        if ticker == "ALE":
+            raise OSError(22, "Invalid argument")
+        return _fake_history([(datetime.date(2020, 1, 5), 100.0)])
+
+    with patch("scripts.backfill_ticker_daily_prices.fetch_ticker_history", return_value=None), patch(
+        "scripts.backfill_ticker_daily_prices.fetch_ticker_history_stockanalysis", side_effect=fake_fallback
+    ):
+        summary = backfill_ticker_daily_prices(conn, use_stockanalysis_fallback=True)
+
+    assert summary["tickers_checked"] == 2
+    assert summary["tickers_no_data"] == 1
+    assert summary["tickers_via_fallback"] == 1
+    rows = conn.execute("SELECT ticker FROM ticker_daily_prices").fetchall()
+    assert [r["ticker"] for r in rows] == ["MSFT"]
+
+
+def test_backfill_still_counts_no_data_when_fallback_also_fails(conn):
+    _insert_trade(conn, "DEADCO", "2020-01-05")
+
+    with patch("scripts.backfill_ticker_daily_prices.fetch_ticker_history", return_value=None), patch(
+        "scripts.backfill_ticker_daily_prices.fetch_ticker_history_stockanalysis", return_value=None
+    ):
+        summary = backfill_ticker_daily_prices(conn, use_stockanalysis_fallback=True)
+
+    assert summary["tickers_no_data"] == 1
+    assert summary["tickers_via_fallback"] == 0
+
+
+def test_backfill_circuit_breaker_threshold_is_configurable(conn):
+    """A rerun scoped to the already-known-empty backlog (--use-stockanalysis-fallback)
+    expects most tickers to fail even with the fallback on - the default threshold would
+    falsely trip on that expected failure rate, so it must be raise-able (or disabled via 0)
+    independent of the normal full-backfill default."""
+    tickers = [f"TICK{i:03d}" for i in range(CONSECUTIVE_NO_DATA_CIRCUIT_BREAKER + 5)]
+    for t in tickers:
+        _insert_trade(conn, t, "2020-01-05")
+
+    with patch("scripts.backfill_ticker_daily_prices.fetch_ticker_history", return_value=None):
+        summary = backfill_ticker_daily_prices(conn, circuit_breaker_threshold=0)
+
+    assert summary["circuit_breaker_tripped"] is False
+    assert summary["tickers_checked"] == len(tickers)
+
+
 def test_backfill_circuit_breaker_resets_on_a_success(conn):
     """An occasional real success in between misses must reset the streak, so a run with a
     normal, scattered rate of genuinely-dead tickers never trips the breaker."""

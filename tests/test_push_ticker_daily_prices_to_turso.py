@@ -32,6 +32,23 @@ def test_push_is_safe_to_rerun(conn, tmp_path, monkeypatch):
     assert [(r["date"], r["price"]) for r in rows] == [("2020-01-02", 100.0)]
 
 
+def test_push_scoped_to_tickers_skips_the_rest(conn, tmp_path, monkeypatch):
+    monkeypatch.delenv("TURSO_DATABASE_URL", raising=False)
+    monkeypatch.delenv("TURSO_AUTH_TOKEN", raising=False)
+    local = models.connect_local(tmp_path / "local.db")
+    models.set_ticker_daily_prices(local, "AAPL", [("2020-01-02", 100.0), ("2020-01-03", 101.0)])
+    models.set_ticker_daily_prices(local, "MSFT", [("2020-01-02", 200.0)])
+    models.set_ticker_daily_prices(local, "HBI", [("2020-01-02", 12.5)])
+
+    count = push_ticker_daily_prices(local, conn, tickers=["AAPL", "HBI"])
+
+    assert count == 3
+    rows = conn.execute("SELECT ticker, date, price FROM ticker_daily_prices ORDER BY ticker, date").fetchall()
+    assert [(r["ticker"], r["date"], r["price"]) for r in rows] == [
+        ("AAPL", "2020-01-02", 100.0), ("AAPL", "2020-01-03", 101.0), ("HBI", "2020-01-02", 12.5),
+    ]
+
+
 def test_push_of_empty_local_table_is_a_no_op(conn, tmp_path, monkeypatch):
     monkeypatch.delenv("TURSO_DATABASE_URL", raising=False)
     monkeypatch.delenv("TURSO_AUTH_TOKEN", raising=False)

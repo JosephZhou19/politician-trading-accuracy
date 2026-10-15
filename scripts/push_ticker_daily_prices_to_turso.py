@@ -14,6 +14,11 @@ Ongoing updates after this one-time push go back to normal: update_ticker_daily_
 via GitHub Actions, writing directly to Turso as today - that job's per-run row count is
 small enough that this local-then-push detour isn't needed there.
 
+--tickers scopes the push to a specific comma-separated list instead of the whole table -
+for pushing just a small delta (e.g. after re-running the backfill with
+--use-stockanalysis-fallback, which only ever touches the still-empty backlog) without
+re-pushing every already-pushed row again.
+
 Usage:
     python -m scripts.push_ticker_daily_prices_to_turso --local-db data/congress_trades.db
 """
@@ -30,8 +35,19 @@ load_dotenv()
 BATCH_SIZE = 500
 
 
-def push_ticker_daily_prices(local_conn, turso_conn, batch_size=BATCH_SIZE):
-    rows = local_conn.execute("SELECT ticker, date, price FROM ticker_daily_prices").fetchall()
+def push_ticker_daily_prices(local_conn, turso_conn, batch_size=BATCH_SIZE, tickers=None):
+    """tickers=None pushes the whole local table (the normal one-time-backfill pairing). A
+    given list scopes the push to just those tickers - for pushing a small, targeted delta
+    (e.g. after re-running the backfill with --use-stockanalysis-fallback, which only ever
+    touches the still-empty backlog) without re-pushing millions of already-pushed rows."""
+    if tickers is None:
+        rows = local_conn.execute("SELECT ticker, date, price FROM ticker_daily_prices").fetchall()
+    else:
+        placeholders = ",".join("?" for _ in tickers)
+        rows = local_conn.execute(
+            f"SELECT ticker, date, price FROM ticker_daily_prices WHERE ticker IN ({placeholders})",
+            list(tickers),
+        ).fetchall()
     triples = [(r["ticker"], r["date"], r["price"]) for r in rows]
     print(f"{len(triples)} row(s) to push, {batch_size} per Turso round-trip "
           f"(~{-(-len(triples) // batch_size)} round-trip(s) total).")
@@ -47,6 +63,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--local-db", default="data/congress_trades.db")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument(
+        "--tickers", default=None,
+        help="Comma-separated tickers to push, instead of the whole local table - for a "
+             "small targeted delta (e.g. after --use-stockanalysis-fallback recovered a "
+             "handful of tickers) without re-pushing everything already pushed before.",
+    )
     args = parser.parse_args()
 
     local_conn = models.connect_local(args.local_db)
@@ -55,7 +77,8 @@ def main():
     # sync_local_mirror.py's own _connect_turso guards against.
     turso_conn = _connect_turso()
 
-    count = push_ticker_daily_prices(local_conn, turso_conn, batch_size=args.batch_size)
+    tickers = args.tickers.split(",") if args.tickers else None
+    count = push_ticker_daily_prices(local_conn, turso_conn, batch_size=args.batch_size, tickers=tickers)
     print(f"\nPushed {count} row(s) to Turso.")
 
 
