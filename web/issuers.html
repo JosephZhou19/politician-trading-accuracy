@@ -88,7 +88,12 @@ function render(list) {
 }
 
 async function main() {
-  allIssuers = await fetchJSON("data/issuers.json");
+  try {
+    allIssuers = await fetchJSON("data/issuers.json");
+  } catch (e) {
+    showLoadError(document.getElementById("loading"), "issuers");
+    return;
+  }
   render(allIssuers);
   document.getElementById("loading").style.display = "none";
   document.getElementById("issuers-panel").style.display = "block";

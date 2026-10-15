@@ -16,6 +16,18 @@ function escapeHtml(value) {
   return div.innerHTML;
 }
 
+// Every page's top-level data load otherwise has no .catch at all: fetchJSON throws on a
+// non-OK response (e.g. a bad deploy leaving a stale/missing JSON file), and an uncaught
+// rejection just leaves the page's "Loading…" text sitting there forever with nothing
+// visible to the visitor - only a console error. Call this from a page's own catch block to
+// turn that into a real, visible message in place of the loading indicator.
+function showLoadError(el, detail) {
+  if (!el) return;
+  el.textContent = "Couldn't load data" + (detail ? ` (${detail})` : "") + " — try refreshing the page.";
+  el.classList.add("error");
+  el.style.display = "block";
+}
+
 async function fetchJSON(path) {
   // no-store, not just a reload: the export reruns once a day and a visitor's browser
   // otherwise has no signal that e.g. data/trades/564.json changed since their last visit

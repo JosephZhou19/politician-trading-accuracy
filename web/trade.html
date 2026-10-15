@@ -165,11 +165,17 @@ async function main() {
 
   if (!id || !legislatorId) return notFound();
 
-  const [legislators, tickers, latestPrices] = await Promise.all([
-    fetchJSON("data/legislators.json"),
-    fetchJSON("data/tickers.json"),
-    fetchJSON("data/latest_prices.json"),
-  ]);
+  let legislators, tickers, latestPrices;
+  try {
+    [legislators, tickers, latestPrices] = await Promise.all([
+      fetchJSON("data/legislators.json"),
+      fetchJSON("data/tickers.json"),
+      fetchJSON("data/latest_prices.json"),
+    ]);
+  } catch (e) {
+    showLoadError(document.getElementById("loading"), "trade data");
+    return;
+  }
 
   const legislator = legislators.find((l) => String(l.id) === String(legislatorId));
   if (!legislator) return notFound();

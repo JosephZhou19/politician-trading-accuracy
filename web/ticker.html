@@ -198,10 +198,18 @@ async function main() {
   const params = new URLSearchParams(window.location.search);
   const ticker = params.get("ticker");
 
-  const [tickers, latestPrices] = await Promise.all([
-    fetchJSON("data/tickers.json"),
-    fetchJSON("data/latest_prices.json"),
-  ]);
+  let tickers, latestPrices;
+  try {
+    [tickers, latestPrices] = await Promise.all([
+      fetchJSON("data/tickers.json"),
+      fetchJSON("data/latest_prices.json"),
+    ]);
+  } catch (e) {
+    showLoadError(document.getElementById("loading"), "ticker data");
+    document.getElementById("chart-loading").style.display = "none";
+    document.getElementById("ticker-subtitle").textContent = "Failed to load";
+    return;
+  }
 
   const assetName = ticker ? tickers[ticker] : null;
   document.title = `${ticker} — Trade Disclosures`;

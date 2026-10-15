@@ -3,6 +3,7 @@ PLAN.md
 NOTES.md
 RESEARCH_STRATEGY_PLAN.md
 RESEARCH_FINDINGS.md
+WEBSITE_UI_TODO.md
 
 # Data — never committed, private/local only
 data/
@@ -16,6 +17,9 @@ web/data/
 
 # Cached external roster data (unitedstates/congress-legislators) - regeneratable, not source
 .cache/
+
+# One-off review scripts - not part of the shipped pipeline
+scripts/repeat_buy_sector_alpha.py
 
 # Quiver Quantitative comparison dumps and the ad hoc script that reads them - not
 # part of the shipped pipeline, private scraped data

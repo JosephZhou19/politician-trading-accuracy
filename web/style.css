@@ -191,11 +191,22 @@ a:hover { text-decoration: underline; }
   padding: 20px 0;
 }
 
+.loading.error {
+  color: var(--sell);
+}
+
 .feed-panel {
   max-height: 520px;
   overflow-y: auto;
+  overflow-x: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+
+/* A plain (non-.feed-panel) table, e.g. index.html's legislators table, needs its own
+   scroll container - a <table> can't scroll itself, only a block element wrapping it can. */
+.table-scroll {
+  overflow-x: auto;
 }
 
 .feed-panel table {
@@ -271,4 +282,23 @@ footer {
   color: var(--muted);
   font-size: 0.78rem;
   padding: 24px;
+}
+
+/* Narrow-viewport layout - tables still scroll horizontally within their own container
+   (.feed-panel / .table-scroll above) rather than ever widening the page itself, so nothing
+   here needs to reflow table columns, just tighten the surrounding chrome. */
+@media (max-width: 640px) {
+  header.site-header { padding: 14px 16px; }
+  main { padding: 16px; }
+
+  .stat-row { gap: 10px; }
+  .stat { min-width: 0; flex: 1 1 calc(50% - 10px); padding: 10px 12px; }
+
+  .chart-wrap { height: 280px; padding: 10px; }
+
+  .filter-row { flex-direction: column; align-items: stretch; }
+  .filter-row input[type="search"], .filter-row select { max-width: none; }
+
+  table { font-size: 0.82rem; }
+  th, td { padding: 7px 8px; }
 }
