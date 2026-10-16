@@ -92,16 +92,6 @@
 <script>
 let allLegislators = [];
 
-function populateFilterOptions(selectEl, values) {
-  const sorted = Array.from(new Set(values.filter(Boolean))).sort();
-  for (const v of sorted) {
-    const opt = document.createElement("option");
-    opt.value = v;
-    opt.textContent = v;
-    selectEl.appendChild(opt);
-  }
-}
-
 function applyFilters() {
   const q = document.getElementById("legislator-search").value.trim().toLowerCase();
   const party = document.getElementById("party-filter").value;

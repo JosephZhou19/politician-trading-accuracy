@@ -57,6 +57,7 @@
       minus sells using each disclosed amount range's midpoint - an approximation, not an
       exact holding value, since STOCK Act filings only report ranges.
     </p>
+    <div class="export-links" id="positions-export">Export: <a href="#" data-export="csv">CSV</a> · <a href="#" data-export="json">JSON</a></div>
     <div class="feed-panel">
       <table id="positions-table">
         <colgroup>
@@ -81,6 +82,16 @@
   <section>
     <h2>Disclosed Trades</h2>
     <p class="muted">Click a trade for its full detail, including price at transaction, price at disclosure, and a chart.</p>
+    <div class="filter-row" id="trades-filter-row" style="display:none">
+      <select id="owner-filter"><option value="">All owners</option></select>
+      <select id="asset-type-filter">
+        <option value="">All types</option>
+        <option value="stock">Stock</option>
+        <option value="option">Option</option>
+        <option value="other">Other</option>
+      </select>
+    </div>
+    <div class="export-links" id="trades-export">Export: <a href="#" data-export="csv">CSV</a> · <a href="#" data-export="json">JSON</a></div>
     <div id="loading" class="loading">Loading…</div>
     <div id="not-found" class="empty" style="display:none">No member found for this ID.</div>
     <div class="feed-panel" id="trades-panel" style="display:none">
@@ -185,6 +196,80 @@ function formatNetApprox(n) {
   return `${sign}$${Math.round(Math.abs(n)).toLocaleString("en-US")}`;
 }
 
+let allTrades = [];
+let tickersLookup = {};
+let currentLegislatorId = null;
+
+// Shared by the initial render and every owner/asset-type filter change - `list` is already
+// filtered (or the full set), so this never needs to know about the filters themselves.
+function renderTradesTable(list) {
+  const tbody = document.querySelector("#trades-table tbody");
+  if (list.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">No trades match these filters.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = list.map((t) => {
+    const assetName = t.ticker ? (tickersLookup[t.ticker] || t.ticker) : (t.asset_name || "—");
+    return `
+      <tr>
+        <td data-sort-value="${escapeHtml(t.ticker || "")}" title="${escapeHtml(assetName)}">
+          ${t.ticker ? `<a href="ticker.html?ticker=${encodeURIComponent(t.ticker)}">${escapeHtml(t.ticker)}</a>` : "—"}
+        </td>
+        <td class="details" title="${escapeHtml(assetName)}${t.comment ? ' — ' + escapeHtml(t.comment) : ''}">${tradeDetails(t, tickersLookup)}</td>
+        <td data-sort-value="${escapeHtml(t.transaction_type)}" class="${typeClass(t.transaction_type)}">${typeLabel(t.transaction_type)}</td>
+        <td data-sort-value="${t.amount_low}">${formatAmount(t.amount_low, t.amount_high)}</td>
+        <td data-sort-value="${t.transaction_date}">${formatDate(t.transaction_date)}</td>
+        <td data-sort-value="${t.notification_date}">${formatDate(t.notification_date)}</td>
+      </tr>
+    `;
+  }).join("");
+  makeRowsClickable(tbody, (i) => `trade.html?id=${list[i].id}&legislator=${currentLegislatorId}`);
+}
+
+// Shared by the table render and the trades CSV/JSON export, so "download what's filtered"
+// can never drift out of sync with "what the table is actually showing".
+function getFilteredTrades() {
+  const owner = document.getElementById("owner-filter").value;
+  const assetType = document.getElementById("asset-type-filter").value;
+  return allTrades.filter((t) => {
+    if (owner && t.owner !== owner) return false;
+    if (assetType && assetTypeBucket(t.asset_type) !== assetType) return false;
+    return true;
+  });
+}
+
+function applyTradeFilters() {
+  renderTradesTable(getFilteredTrades());
+}
+
+document.getElementById("owner-filter").addEventListener("change", applyTradeFilters);
+document.getElementById("asset-type-filter").addEventListener("change", applyTradeFilters);
+
+const TRADE_EXPORT_COLUMNS = [
+  { key: "ticker", header: "Ticker" },
+  { key: "asset_name", header: "Asset Name", get: (t) => t.ticker ? (tickersLookup[t.ticker] || t.ticker) : (t.asset_name || "") },
+  { key: "transaction_type", header: "Transaction Type", get: (t) => typeLabel(t.transaction_type) },
+  { key: "owner", header: "Owner", get: (t) => ownerLabel(t.owner) },
+  { key: "asset_type", header: "Asset Type", get: (t) => t.asset_type || "" },
+  { key: "amount_low", header: "Amount Low" },
+  { key: "amount_high", header: "Amount High" },
+  { key: "transaction_date", header: "Transaction Date" },
+  { key: "notification_date", header: "Disclosed Date" },
+  { key: "comment", header: "Comment", get: (t) => t.comment || "" },
+];
+
+const POSITION_EXPORT_COLUMNS = [
+  { key: "ticker", header: "Ticker" },
+  { key: "label", header: "Name" },
+  { key: "buys", header: "Buys" },
+  { key: "sells", header: "Sells" },
+  { key: "netApprox", header: "Net $ (approx.)" },
+  { key: "first", header: "First Trade" },
+  { key: "last", header: "Last Trade" },
+];
+
+let currentPositions = [];
+
 function renderPositions(positions) {
   const tbody = document.querySelector("#positions-table tbody");
   tbody.innerHTML = positions.map((p) => `
@@ -254,22 +339,9 @@ async function main() {
     <div class="stat"><div class="label">Sells</div><div class="value">${sells}</div></div>
   `;
 
-  const tbody = document.querySelector("#trades-table tbody");
-  tbody.innerHTML = trades.map((t) => {
-    const assetName = t.ticker ? (tickers[t.ticker] || t.ticker) : (t.asset_name || "—");
-    return `
-      <tr>
-        <td data-sort-value="${escapeHtml(t.ticker || "")}" title="${escapeHtml(assetName)}">
-          ${t.ticker ? `<a href="ticker.html?ticker=${encodeURIComponent(t.ticker)}">${escapeHtml(t.ticker)}</a>` : "—"}
-        </td>
-        <td class="details" title="${escapeHtml(assetName)}${t.comment ? ' — ' + escapeHtml(t.comment) : ''}">${tradeDetails(t, tickers)}</td>
-        <td data-sort-value="${escapeHtml(t.transaction_type)}" class="${typeClass(t.transaction_type)}">${typeLabel(t.transaction_type)}</td>
-        <td data-sort-value="${t.amount_low}">${formatAmount(t.amount_low, t.amount_high)}</td>
-        <td data-sort-value="${t.transaction_date}">${formatDate(t.transaction_date)}</td>
-        <td data-sort-value="${t.notification_date}">${formatDate(t.notification_date)}</td>
-      </tr>
-    `;
-  }).join("");
+  allTrades = trades;
+  tickersLookup = tickers;
+  currentLegislatorId = legislator.id;
 
   document.getElementById("loading").style.display = "none";
   if (trades.length === 0) {
@@ -277,14 +349,25 @@ async function main() {
     document.getElementById("not-found").style.display = "block";
   } else {
     document.getElementById("trades-panel").style.display = "block";
+    populateFilterOptions(document.getElementById("owner-filter"), trades.map((t) => t.owner), ownerLabel);
+    document.getElementById("trades-filter-row").style.display = "flex";
+    applyTradeFilters();
     makeSortable(document.getElementById("trades-table"));
-    makeRowsClickable(tbody, (i) => `trade.html?id=${trades[i].id}&legislator=${legislator.id}`);
+    initExportLinks(
+      document.getElementById("trades-export"), getFilteredTrades, TRADE_EXPORT_COLUMNS,
+      `${legislator.last_name}_trades`
+    );
 
     renderTimeline(document.getElementById("timeline-chart"), trades);
     document.getElementById("timeline-section").style.display = "block";
 
-    renderPositions(computePositions(trades, tickers));
+    currentPositions = computePositions(trades, tickers);
+    renderPositions(currentPositions);
     document.getElementById("positions-section").style.display = "block";
+    initExportLinks(
+      document.getElementById("positions-export"), () => currentPositions, POSITION_EXPORT_COLUMNS,
+      `${legislator.last_name}_positions`
+    );
   }
 }
 

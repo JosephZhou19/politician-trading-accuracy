@@ -251,6 +251,14 @@ a:hover { text-decoration: underline; }
   margin-top: 2px;
 }
 
+.export-links {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.export-links a { margin-left: 4px; }
+
 .loading, .empty {
   color: var(--muted);
   padding: 20px 0;

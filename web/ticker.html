@@ -61,6 +61,7 @@
   <section>
     <h2>Disclosed Trades</h2>
     <p class="muted">Click a trade for its full detail, including price at transaction, price at disclosure, and a chart.</p>
+    <div class="export-links" id="trades-export">Export: <a href="#" data-export="csv">CSV</a> · <a href="#" data-export="json">JSON</a></div>
     <div id="loading" class="loading">Loading…</div>
     <div id="not-found" class="empty" style="display:none">No disclosed trades found for this ticker.</div>
     <div class="feed-panel" id="trades-panel" style="display:none">
@@ -210,6 +211,19 @@ function renderPriceChart(canvas, controlsEl, series, trades) {
   setRange("90d");
 }
 
+const TICKER_TRADE_EXPORT_COLUMNS = [
+  { key: "legislator_name", header: "Member" },
+  { key: "chamber", header: "Chamber", get: (t) => chamberLabel(t.chamber) },
+  { key: "transaction_type", header: "Transaction Type", get: (t) => typeLabel(t.transaction_type) },
+  { key: "owner", header: "Owner", get: (t) => ownerLabel(t.owner) },
+  { key: "asset_type", header: "Asset Type", get: (t) => t.asset_type || "" },
+  { key: "amount_low", header: "Amount Low" },
+  { key: "amount_high", header: "Amount High" },
+  { key: "transaction_date", header: "Transaction Date" },
+  { key: "notification_date", header: "Disclosed Date" },
+  { key: "comment", header: "Comment", get: (t) => t.comment || "" },
+];
+
 async function main() {
   const params = new URLSearchParams(window.location.search);
   const ticker = params.get("ticker");
@@ -292,6 +306,7 @@ async function main() {
     document.getElementById("trades-panel").style.display = "block";
     makeSortable(document.getElementById("trades-table"));
     makeRowsClickable(tbody, (i) => `trade.html?id=${trades[i].id}&legislator=${trades[i].legislator_id}`);
+    initExportLinks(document.getElementById("trades-export"), () => trades, TICKER_TRADE_EXPORT_COLUMNS, `${ticker}_trades`);
   }
 }
 

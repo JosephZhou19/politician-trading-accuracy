@@ -42,6 +42,7 @@
     <h2>Traded Issuers</h2>
     <p class="muted">Stocks only - bonds, funds, and other non-stock disclosures are excluded.</p>
     <input type="search" id="issuer-search" placeholder="Search by ticker or name…">
+    <div class="export-links" id="issuers-export">Export: <a href="#" data-export="csv">CSV</a> · <a href="#" data-export="json">JSON</a></div>
     <div id="loading" class="loading">Loading…</div>
     <div class="feed-panel" id="issuers-panel" style="display:none">
       <table id="issuers-table">
@@ -103,6 +104,26 @@ function render(list) {
   `).join("");
 }
 
+const ISSUER_EXPORT_COLUMNS = [
+  { key: "ticker", header: "Ticker" },
+  { key: "asset_name", header: "Name" },
+  { key: "last_traded", header: "Last Traded" },
+  { key: "volume", header: "Disclosed Volume" },
+  { key: "trade_count", header: "Trades" },
+  { key: "distinct_politicians", header: "Politicians" },
+  { key: "current_price", header: "Current Price" },
+  { key: "price_change_30d", header: "30-Day Change (%)", get: (i) => i.price_change_30d != null ? (i.price_change_30d * 100).toFixed(1) : "" },
+];
+
+// Shared by the table render and the export links, so a download always matches whatever
+// the search box is currently narrowing the table down to.
+function getFilteredIssuers() {
+  const q = document.getElementById("issuer-search").value.trim().toLowerCase();
+  return q
+    ? allIssuers.filter((i) => i.ticker.toLowerCase().includes(q) || i.asset_name.toLowerCase().includes(q))
+    : allIssuers;
+}
+
 async function main() {
   try {
     allIssuers = await fetchJSON("data/issuers.json");
@@ -114,14 +135,11 @@ async function main() {
   document.getElementById("loading").style.display = "none";
   document.getElementById("issuers-panel").style.display = "block";
   makeSortable(document.getElementById("issuers-table"));
+  initExportLinks(document.getElementById("issuers-export"), getFilteredIssuers, ISSUER_EXPORT_COLUMNS, "issuers");
 }
 
-document.getElementById("issuer-search").addEventListener("input", (e) => {
-  const q = e.target.value.trim().toLowerCase();
-  const filtered = q
-    ? allIssuers.filter((i) => i.ticker.toLowerCase().includes(q) || i.asset_name.toLowerCase().includes(q))
-    : allIssuers;
-  render(filtered);
+document.getElementById("issuer-search").addEventListener("input", () => {
+  render(getFilteredIssuers());
 });
 
 main();

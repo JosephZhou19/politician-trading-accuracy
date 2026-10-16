@@ -10,6 +10,25 @@ const TYPE_LABELS = {
   exchange: "Exchange",
 };
 
+const OWNER_LABELS = {
+  self: "Self",
+  spouse: "Spouse",
+  joint: "Joint",
+  dependent_child: "Dependent Child",
+};
+
+// The raw asset_type on a trade is one of ~13 official House/Senate PTR codes (ST, OP, GS,
+// CS, ETF, AB, OL, PS, OI, VA, HN, "ETF" vs "ET" inconsistently, ...) - too granular and too
+// inconsistently populated to filter on directly. Bucketed down to the three categories
+// RESEARCH_STRATEGY_PLAN.md §10 and the UI review actually care about distinguishing.
+function assetTypeBucket(assetType) {
+  if (assetType === "ST") return "stock";
+  if (assetType === "OP") return "option";
+  return "other";
+}
+
+const ASSET_TYPE_BUCKET_LABELS = { stock: "Stock", option: "Option", other: "Other" };
+
 function escapeHtml(value) {
   const div = document.createElement("div");
   div.textContent = value == null ? "" : String(value);
@@ -95,6 +114,25 @@ function typeClass(type) {
   return "type-" + type;
 }
 
+function ownerLabel(owner) {
+  return OWNER_LABELS[owner] || owner;
+}
+
+// Fills a <select> with one <option> per distinct value present in `values` (sorted, blanks
+// dropped - the select's own first "All ..." option already covers that case), sharing one
+// implementation across every page's filter dropdowns rather than each re-populating its
+// own party/state/owner list by hand. `labelFor` renders a value to display text (e.g.
+// "dependent_child" -> "Dependent Child"); defaults to the raw value when omitted.
+function populateFilterOptions(selectEl, values, labelFor = (v) => v) {
+  const sorted = Array.from(new Set(values.filter(Boolean))).sort();
+  for (const v of sorted) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = labelFor(v);
+    selectEl.appendChild(opt);
+  }
+}
+
 function chamberLabel(chamber) {
   if (chamber === "house") return "House";
   if (chamber === "senate") return "Senate";
@@ -161,6 +199,65 @@ function makeSortable(table) {
       });
       rows.forEach((row) => tbody.appendChild(row));
     });
+  });
+}
+
+function downloadFile(filename, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function exportColumnValue(column, row) {
+  return column.get ? column.get(row) : row[column.key];
+}
+
+// `columns`: [{ key, header, get? }] - `key` is both the raw field name (used as the JSON
+// property name) and the fallback lookup into `row`; `header` is the CSV column title;
+// `get(row)` overrides the value for either format (e.g. a formatted label instead of a raw
+// code). Quotes a cell only when it actually contains a comma/quote/newline, per RFC 4180.
+function rowsToCSV(rows, columns) {
+  const escapeCell = (v) => {
+    const s = v == null ? "" : String(v);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [columns.map((c) => escapeCell(c.header))];
+  for (const row of rows) lines.push(columns.map((c) => escapeCell(exportColumnValue(c, row))));
+  return lines.map((line) => line.join(",")).join("\r\n");
+}
+
+function rowsToJSON(rows, columns) {
+  return JSON.stringify(
+    rows.map((row) => {
+      const obj = {};
+      for (const c of columns) obj[c.key] = exportColumnValue(c, row);
+      return obj;
+    }),
+    null, 2
+  );
+}
+
+// Wires a "CSV"/"JSON" export link pair (data-export="csv"/"json" inside `containerEl`) to
+// download `getRows()`'s result as `filenameBase.csv`/`.json` shaped by `columns`. `getRows` is
+// called fresh at click time rather than once up front, so the export always reflects whatever
+// filter/search state is current on the page, not just what was visible when the page loaded.
+function initExportLinks(containerEl, getRows, columns, filenameBase) {
+  if (!containerEl) return;
+  const csvLink = containerEl.querySelector('[data-export="csv"]');
+  const jsonLink = containerEl.querySelector('[data-export="json"]');
+  if (csvLink) csvLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    downloadFile(`${filenameBase}.csv`, rowsToCSV(getRows(), columns), "text/csv;charset=utf-8;");
+  });
+  if (jsonLink) jsonLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    downloadFile(`${filenameBase}.json`, rowsToJSON(getRows(), columns), "application/json");
   });
 }
 
